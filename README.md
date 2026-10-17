@@ -121,3 +121,18 @@ i686-w64-mingw32-g++ -shared -O3 -s -std=c++17     -static -static-libgcc -stati
 ```
 
 Copy the generated `d3d9.dll` and `mtld3d.conf` directly into your Majesty 2 root directory.
+
+
+## Golden v10: RenderRC Hook & GPU Sub-Frame Replay Architecture
+
+### 1. Engine Render Hook ( at )
+- Hooks into Majesty 2's primary rendering callback  at offset .
+- Intercepts viewport and scene rendering passes before frame presentation, preventing engine race conditions and ensuring deterministic HUD/overlay compositing.
+
+### 2.  GPU Sub-Frame Replay
+- Transparently captures and resolves intermediate offscreen render targets via hardware-accelerated .
+- Enables high-frequency GPU sub-frame replay across multi-threaded render state changes, eliminating HUD flicker and depth buffer synchronization stalls during Turbo mode speedups.
+
+### 3. Sampler State Shadow Cache
+- Implements a hardware-level shadow cache for D3D9 sampler states (, , , ).
+- Redundant driver-level state transitions are filtered out in hot render paths, yielding substantial draw call latency reduction under high unit-count scenarios.
