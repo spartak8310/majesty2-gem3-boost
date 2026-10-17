@@ -1342,7 +1342,7 @@ static void* SpeedSwitcher(void) {
 static bool DebugLogHas(const char* needle) {
     static char log[262144];
     DWORD len = 0;
-    if (!ReadFileSmall("Z:\\Users\\developer\\Documents\\majesty2\\M2_Debug.log", log, sizeof(log), &len)) return false;
+    if (!ReadFileSmall("Z:\\Users\\orkodav4421\\Documents\\majesty2\\M2_Debug.log", log, sizeof(log), &len)) return false;
     return strstr(log, needle) != NULL;
 }
 
