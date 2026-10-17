@@ -1206,7 +1206,7 @@ static void LogModules(const char* tag) {
     }
 }
 
-// Unix env as seen inside the Windows process (Open Source Contributor may override what the bench passes).
+// Unix env as seen inside the Windows process (Sikarugir may override what the bench passes).
 static void LogEnv(void) {
     static const char* const keys[] = {"VK_DRIVER_FILES", "VK_ICD_FILENAMES", "DXVK_ASYNC", "DXVK_HUD",
                                        "DXVK_SHADER_CACHE_PATH", "MTL_HUD_ENABLED", "WINEMSYNC", "WINEESYNC",
