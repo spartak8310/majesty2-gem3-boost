@@ -31,6 +31,7 @@ static uint32_t g_m2DecoupleSkippedLastSec = 0;
 
 // 120 FPS Unlocker state (app.dll Sleep(3)->NOP + pro_sleepRender=0 + r_waitForRenderDone=0 + VSync OFF)
 static int g_m2Unlock120Installed = 0;
+static int g_m2AppSleepPatched = 0;
 static HMODULE g_m2AppMod = NULL;
 static uint32_t g_m2ToastFrames = 180; // Show visual indicator bar for first 180 frames and on every F8-F11 keypress
 
@@ -53,6 +54,20 @@ static inline const char* M2_DecoupleModeName(int m) {
     return "2x";
 }
 
+static inline void M2_TurboV9_TickUnlock(void) {
+    if (g_m2AppSleepPatched || g_m2Unlock120Installed) {
+        HMODULE hApp = g_m2AppMod ? g_m2AppMod : GetModuleHandleA("app.dll");
+        if (hApp) {
+            *(volatile uint32_t*)((uintptr_t)hApp + 0x31df0) = 0;
+            *(volatile uint32_t*)((uintptr_t)hApp + 0x31e20) = 0;
+        }
+    }
+}
+
+static inline void M2_TurboHud_OnPresent(void* pDevice) {
+    M2_TurboV9_TickUnlock();
+}
+
 static inline void M2_TurboV8_UnlockApp120Fps(void) {
     if (!g_m2AppMod) {
         g_m2AppMod = GetModuleHandleA("app.dll");
@@ -68,17 +83,23 @@ static inline void M2_TurboV8_UnlockApp120Fps(void) {
             if (VirtualProtect(pSleep, 8, PAGE_EXECUTE_READWRITE, &oldProt)) {
                 for (int k = 0; k < 8; ++k) pSleep[k] = 0x90;
                 VirtualProtect(pSleep, 8, oldProt, &oldProt);
-                LogLine("turbo_v8: patched app.dll!eApplication::Working RVA +0x13ba6 (Sleep(3) -> 8x NOP for 120Hz ProMotion)");
+                LogLine("turbo_v9: patched app.dll!eApplication::Working RVA +0x13ba6 (Sleep(3) -> 8x NOP for 120Hz ProMotion)");
             }
         }
         g_m2Unlock120Installed = 1;
+        g_m2AppSleepPatched = 1;
     }
 
-    // 2. Clear pro_sleepRender (+0x31df0) and r_waitForRenderDone (+0x31e20) in app.dll data section
-    int* pProSleepRender = (int*)(base + 0x31df0);
-    uint8_t* pWaitRenderDone = (uint8_t*)(base + 0x31e20);
-    if (*pProSleepRender != 0) *pProSleepRender = 0;
-    if (*pWaitRenderDone != 0) *pWaitRenderDone = 0;
+    // 2. Clear pro_sleepRender (+0x31df0) and r_waitForRenderDone (+0x31e20) as 32-bit uint32_t after VirtualProtect RW
+    DWORD oldProt = 0;
+    if (VirtualProtect(base + 0x31df0, 0x100, PAGE_READWRITE, &oldProt)) {
+        *(volatile uint32_t*)(base + 0x31df0) = 0;
+        *(volatile uint32_t*)(base + 0x31e20) = 0;
+    } else {
+        *(volatile uint32_t*)(base + 0x31df0) = 0;
+        *(volatile uint32_t*)(base + 0x31e20) = 0;
+    }
+    g_m2AppSleepPatched = 1;
 }
 
 static inline void M2_TurboV8_ForcePresentParams120Hz(void* pPresentationParameters, const char* caller) {
@@ -130,13 +151,14 @@ static inline int M2_DecoupleFilterQuant(int levelUp, int fdtMs, int detOn, int 
     M2_TurboV7_InitEnv();
     M2_TurboV8_UnlockApp120Fps();
     *outEffMs = ms;
-    if (!levelUp || g_m2DecoupleMode <= 0 || fdtMs > 0 || detOn) {
+    // Decoupler does NOT require levelUp strictly set by -autostart
+    if (g_m2DecoupleMode <= 0 || fdtMs > 0 || detOn) {
         g_m2DecoupleSkipPhase = 0;
         g_m2DecoupleAccumMs = 0;
         return 0;
     }
-    double thresh = (g_m2DecoupleMode >= 2) ? 0.2 : 3.5;
-    if (g_m2LastRealQuantMs < thresh) {
+    const float threshMs = (g_m2DecoupleMode == 2) ? 0.1f : 0.4f;
+    if (g_m2LastRealQuantMs < (double)threshMs) {
         g_m2DecoupleSkipPhase = 0;
         if (g_m2DecoupleAccumMs > 0) {
             int tot = ms + g_m2DecoupleAccumMs;
@@ -263,7 +285,7 @@ static inline void M2_TurboHud_RefreshTitleNow(void) {
     if (!wnd || !IsWindow(wnd)) return;
     char title[320];
     snprintf(title, sizeof(title),
-             "Majesty 2 [TURBO v8 120Hz] | %.1f FPS (%.1fms) | Quant: %.1fms (%.1fx) | [F8] %s | [F9] SSE2:%s | [F10] Decouple:%s(skip:%u/s) | [F11] Cam:%s",
+             "Majesty 2 [TURBO v9 120Hz] | %.1f FPS (%.1fms) | Quant: %.1fms (%.1fx) | [F8] %s | [F9] SSE2:%s | [F10] Decouple:%s(skip:%u/s) | [F11] Cam:%s",
              g_m2LastFps, g_m2LastAvgMs, g_m2LastQuantMs, g_m2LastGameX > 0.0 ? g_m2LastGameX : 1.0,
              M2_HdrModeName(g_m2HdrMode),
              g_w6LiveEnabled ? "ON(13)" : "OFF",
@@ -275,6 +297,8 @@ static inline void M2_TurboHud_RefreshTitleNow(void) {
 
 static inline void M2_TurboHud_PollHotkeys(void* pDevice) {
     M2_TurboV7_InitEnv();
+    M2_TurboV9_TickUnlock();
+    M2_TurboHud_OnPresent(pDevice);
     if (g_m2HdrDirty && pDevice) {
         M2_TurboHud_ApplyHdrRamp(pDevice);
     }

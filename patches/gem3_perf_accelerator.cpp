@@ -1,6 +1,6 @@
 /**
  * GEM 3 Engine Performance Accelerator & D3D9 Stall Eliminator (`gem3_perf_accelerator.cpp`)
- * Target: Majesty 2 Collection v1.5.356 (32-bit x86 PE / Wine / CrossOver / Rosetta 2 / Proton)
+ * Target: Majesty 2 Collection v1.5.356 (32-bit x86 PE / Wine / Wine/Whisky / Rosetta 2 / Proton)
  *
  * Root Causes Addressed:
  * 1. `geometry.dll` has 16,973 legacy x87 FPU instructions and 0 SSE instructions.

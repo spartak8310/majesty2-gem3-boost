@@ -1206,7 +1206,7 @@ static void LogModules(const char* tag) {
     }
 }
 
-// Unix env as seen inside the Windows process (Sikarugir may override what the bench passes).
+// Unix env as seen inside the Windows process (Open Source Contributor may override what the bench passes).
 static void LogEnv(void) {
     static const char* const keys[] = {"VK_DRIVER_FILES", "VK_ICD_FILENAMES", "DXVK_ASYNC", "DXVK_HUD",
                                        "DXVK_SHADER_CACHE_PATH", "MTL_HUD_ENABLED", "WINEMSYNC", "WINEESYNC",
@@ -1228,6 +1228,7 @@ typedef float (__thiscall *PFN_QcFloat)(void* self);
 static PFN_QcGet g_qcGet = NULL;
 static PFN_QcFloat g_qcSpeed = NULL, g_qcSpeedScale = NULL;
 static bool g_levelUp = false;
+static bool g_autostart = false;
 static LARGE_INTEGER g_levelUpTick = {0};  // QPC when SecondUpdate was seen
 static LARGE_INTEGER g_speed5Tick = {0};   // QPC when 5x SpeedScale actually became active
 
@@ -6195,6 +6196,12 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
     ProfilerTick(now);
     if (!g_m2HudWnd && hDestWindowOverride) g_m2HudWnd = hDestWindowOverride;
     M2_TurboHud_PollHotkeys(pDevice);
+    M2_TurboHud_OnPresent(pDevice);
+    if (!g_levelUp && (g_draws > 200 || (g_r3Draws - g_r3DrawsAtP) > 80)) {
+        g_levelUp = true;
+        QueryPerformanceCounter(&g_levelUpTick);
+        LogLine("golden_v9: normal gameplay 3D scene active -> latched g_levelUp=true");
+    }
     M2ArenaLateSweep();   // Splice 1: free-family hooks for DLLs loaded after device creation
     if (dcOwnsSwap) {
         // frame handed to the presenter thread: neither presented here nor skipped
@@ -6531,6 +6538,28 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
         // Splice 1: no DisableThreadLibraryCalls - THREAD_DETACH must fire so dying
         // threads publish their arena free lists back to the global stacks.
+        char benchEv[16] = {0};
+        if (GetEnvironmentVariableA("M2_BENCHMARK", benchEv, sizeof(benchEv)) > 0 && benchEv[0] == '1') {
+            g_autostart = true;
+        }
+        if (GetFileAttributesA("Z:\\tmp\\m2_autostart.txt") != INVALID_FILE_ATTRIBUTES) {
+            g_autostart = true;
+        }
+        const char* cmdLine = GetCommandLineA();
+        if (cmdLine && (strstr(cmdLine, "-autostart") || strstr(cmdLine, "-benchmark") || strstr(cmdLine, "m2_autostart"))) {
+            g_autostart = true;
+        }
+        if (g_autostart) {
+            DWORD oldProt = 0;
+            if (VirtualProtect((void*)0x004D46A6, 5, PAGE_EXECUTE_READWRITE, &oldProt)) {
+                uint8_t patch[5] = {0xB0, 0x01, 0x90, 0x90, 0x90};
+                memcpy((void*)0x004D46A6, patch, 5);
+                VirtualProtect((void*)0x004D46A6, 5, oldProt, &oldProt);
+                LogLine("golden_v9: benchmark autostart -> patched Majesty2.exe 0x004D46A6 to B0 01 90 90 90 (skip DLC dialog)");
+            }
+        } else {
+            LogLine("golden_v9: normal mode -> leaving 0x004D46A6 untouched (DLC selector enabled)");
+        }
     } else if (fdwReason == DLL_THREAD_DETACH) {
         M2A_ThreadDetach();
     } else if (fdwReason == DLL_PROCESS_DETACH) {

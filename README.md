@@ -1,6 +1,6 @@
 # Majesty 2: GEM 3 Engine Turbo Boost (`Golden v9`)
 
-A high-performance Direct3D 9 proxy, SSE2 vectorizer, and sub-tick presentation decoupler for 1C:Ino-Co's GEM 3 engine (*Majesty 2: The Fantasy Kingdom Sim* and all expansions). Engineered specifically for Apple Silicon via native Metal 3 translation.
+A high-performance Direct3D 9 proxy, SSE2 vectorizer, and sub-tick presentation decoupler for 1C:Ino-Co's GEM 3 engine (*Majesty 2: The Fantasy Kingdom Sim* and all expansions). Engineered specifically for Apple Silicon via native Metal 4 translation.
 
 ---
 
@@ -10,7 +10,7 @@ A high-performance Direct3D 9 proxy, SSE2 vectorizer, and sub-tick presentation 
 | :--- | :--- |
 | **Reference Hardware** | **Apple M3 Pro** (`MacBook Pro 14-inch, Mac15,6`) |
 | **CPU** | 11-core Apple Silicon (5 Performance + 6 Efficiency cores) |
-| **GPU** | 14-core Apple Silicon Metal 3 GPU |
+| **GPU** | 14-core Apple Silicon Metal 4 GPU |
 | **Memory** | 18 GB Unified Memory (150 GB/s memory bandwidth) |
 | **Display** | Liquid Retina XDR (`3024x1964` native, `1512x982 @ 120Hz ProMotion`) |
 | **Operating System** | macOS 27.0 |

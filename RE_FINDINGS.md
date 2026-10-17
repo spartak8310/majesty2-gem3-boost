@@ -1,6 +1,6 @@
 # Полный отчёт по реверс-инжинирингу Majesty 2 Collection (Движок GEM 3, v1.5.356)
 
-Данный документ содержит исчерпывающие результаты статического и бинарного анализа исполняемых модулей (`Majesty2.exe`, `M2Editor.exe`, 42 нативных DLL движка **GEM 3** и 2 `.NET`-утилит), закрытых архивов ресурсов (`.pak`) и конфигурационных подсистем игры **Majesty 2 Collection** (`/Users/orkodav4421/Documents/Majesty2_Archive/Majesty 2 Collection`).
+Данный документ содержит исчерпывающие результаты статического и бинарного анализа исполняемых модулей (`Majesty2.exe`, `M2Editor.exe`, 42 нативных DLL движка **GEM 3** и 2 `.NET`-утилит), закрытых архивов ресурсов (`.pak`) и конфигурационных подсистем игры **Majesty 2 Collection** (`./Documents/Majesty2_Archive/Majesty 2 Collection`).
 
 ---
 
@@ -24,10 +24,10 @@
 - **Извлечено консольных переменных (`eConVar<T>`) и команд (`eConProcessor`):** `457`
 
 ### Ключевые артефакты SDK в рабочей области:
-- [`sdk/exports_by_dll.json`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/sdk/exports_by_dll.json) — полная база экспортов, импортов и RTTI-иерархий по всем 44 модулям.
-- [`sdk/GEM3_ENGINE_API.md`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/sdk/GEM3_ENGINE_API.md) — архитектурный справочник по подсистемам движка (`base.dll`, `io.dll`, `device.dll`, `render.dll`, `scene.dll`, `geometry.dll`, `pf.dll`, `ps.dll`, `entity.dll`, `Multiplayer.dll` и др.).
-- [`sdk/include/gem3_plugin_sdk.h`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/sdk/include/gem3_plugin_sdk.h) — готовый C/C++ заголовочный файл с выверенными `pragma pack(push, 1)` структурами (`Vec2`, `Vec3`, `Vec4`, `Quaternion`, `Matrix33`, `Matrix34`, `Matrix44`, `eBoxGeneric<Vec3>`, `eFrustum`, `xIo::ICryptoStreamFactory`, `xScene::eQuantControl`, `eConVar<T>`) и объявлениями функций для написания плагинов и бинарных хуков.
-- [`sdk/engine_cvars.json`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/sdk/engine_cvars.json) — полный реестр всех `457` консольных переменных и команд движка с точными виртуальными адресами (`VA`), типами, дефолтными значениями и описаниями.
+- [`sdk/exports_by_dll.json`](file://./sdk/exports_by_dll.json) — полная база экспортов, импортов и RTTI-иерархий по всем 44 модулям.
+- [`sdk/GEM3_ENGINE_API.md`](file://./sdk/GEM3_ENGINE_API.md) — архитектурный справочник по подсистемам движка (`base.dll`, `io.dll`, `device.dll`, `render.dll`, `scene.dll`, `geometry.dll`, `pf.dll`, `ps.dll`, `entity.dll`, `Multiplayer.dll` и др.).
+- [`sdk/include/gem3_plugin_sdk.h`](file://./sdk/include/gem3_plugin_sdk.h) — готовый C/C++ заголовочный файл с выверенными `pragma pack(push, 1)` структурами (`Vec2`, `Vec3`, `Vec4`, `Quaternion`, `Matrix33`, `Matrix34`, `Matrix44`, `eBoxGeneric<Vec3>`, `eFrustum`, `xIo::ICryptoStreamFactory`, `xScene::eQuantControl`, `eConVar<T>`) и объявлениями функций для написания плагинов и бинарных хуков.
+- [`sdk/engine_cvars.json`](file://./sdk/engine_cvars.json) — полный реестр всех `457` консольных переменных и команд движка с точными виртуальными адресами (`VA`), типами, дефолтными значениями и описаниями.
 
 ---
 
@@ -79,7 +79,7 @@
    $$P_i = M_i \oplus M_{i-1}, \quad P_0 = M_0$$
 
 > [!IMPORTANT]
-> Поскольку $C'_i = C_i \oplus C_{i+1}$ зависит только от соседнего зашифрованного блока, а $P_i = M_i \oplus M_{i-1}$ зависит только от предыдущего выхода `AES_Decrypt`, **каждый 16-байтный блок $P_i$ ($i \ge 1$) вычисляется полностью локально по трём соседним блокам $(C_{i-1}, C_i, C_{i+1})$ без необходимости последовательного чтения от начала файла!** Именно это свойство позволяет движку выполнять произвольный `Seek` внутри зашифрованного `.pak`-архива, а нашему распаковщику [`tools/unpack_closed_pak.py`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/tools/unpack_closed_pak.py) — мгновенно расшифровывать архивы любого размера.
+> Поскольку $C'_i = C_i \oplus C_{i+1}$ зависит только от соседнего зашифрованного блока, а $P_i = M_i \oplus M_{i-1}$ зависит только от предыдущего выхода `AES_Decrypt`, **каждый 16-байтный блок $P_i$ ($i \ge 1$) вычисляется полностью локально по трём соседним блокам $(C_{i-1}, C_i, C_{i+1})$ без необходимости последовательного чтения от начала файла!** Именно это свойство позволяет движку выполнять произвольный `Seek` внутри зашифрованного `.pak`-архива, а нашему распаковщику [`tools/unpack_closed_pak.py`](file://./tools/unpack_closed_pak.py) — мгновенно расшифровывать архивы любого размера.
 
 ### 2.4. Таблица ключей и сигнатур всех 6 закрытых `.pak`-архивов
 
@@ -92,20 +92,20 @@
 | `texts.expansion_3.pak` | `991 392` | `#28` (`Majesty2.exe`) | `b3f1ba35 f5dd23c2 2f60f8f0 9461abbc` | `6e766b647269653738716b646c6f3033` (`nvkdrie78qkdlo03`) | `149` |
 | `3d.expansion_2.pak` | `46 420 512` | `#22` (`Majesty2.exe`) | `bb8ca061 06da0da4 54dd9c58 c145fb95` | `687565726f3138736a666c65726f7573` (`huero18sjflerous`) | `172` |
 
-Все 6 архивов (`1 990` файлов) полностью расшифрованы и распакованы утилитой [`tools/unpack_closed_pak.py`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/tools/unpack_closed_pak.py) в каталог [`unpacked/`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/unpacked/).
+Все 6 архивов (`1 990` файлов) полностью расшифрованы и распакованы утилитой [`tools/unpack_closed_pak.py`](file://./tools/unpack_closed_pak.py) в каталог [`unpacked/`](file://./unpacked/).
 
 ---
 
 ## 3. Анализ и замена .NET-утилит (`Majesty2Selector.exe`, `Change profile name.exe`)
 
-Обе сервисные утилиты из корня игры (`Majesty2Selector.exe` и `support/Change profile name.exe`) представляют собой 32-битные `.NET 2.0` WinForms-сборки. Полный декомпилированный код и разбор находятся в [`decompiled/Majesty2Selector_analysis.md`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/decompiled/Majesty2Selector_analysis.md).
+Обе сервисные утилиты из корня игры (`Majesty2Selector.exe` и `support/Change profile name.exe`) представляют собой 32-битные `.NET 2.0` WinForms-сборки. Полный декомпилированный код и разбор находятся в [`decompiled/Majesty2Selector_analysis.md`](file://./decompiled/Majesty2Selector_analysis.md).
 
 ### Выявленные дефекты оригинальных утилит:
 1. **Катастрофически медленное копирование `.pak`-архивов в `Majesty2Selector.exe` (`Form1.CopyFile`):** вместо `File.Copy` или блочного буфера используется побайтовый цикл `while (fsIn.Position < fsIn.Length) fsOut.WriteByte((byte)fsIn.ReadByte());`, выполняющий сотни миллионов системных вызовов при переключении аддонов.
-2. **Жёсткая привязка к реестру Windows (`HKCU\Software\1C\Majesty2\Path`)** и падение с необработанным `NullReferenceException`, если ключ реестра отсутствует (что всегда происходит при переносимом запуске через Wine/CrossOver на macOS).
+2. **Жёсткая привязка к реестру Windows (`HKCU\Software\1C\Majesty2\Path`)** и падение с необработанным `NullReferenceException`, если ключ реестра отсутствует (что всегда происходит при переносимом запуске через Wine/Wine/Whisky на macOS).
 3. **Некорректная перекодировка профиля в `Change profile name.exe`:** утилита читает путь из `user.ini`, декодирует однобайтную строку `Windows-1251` как `UTF-16LE` (`Encoding.Unicode`) при записи имени профиля в `profile.user`, что приводит к порче кириллических символов на системах с нерусской системной локалью.
 
-В качестве нативной замены для macOS / Linux / Windows создана утилита [`tools/m2_profile_selector.py`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/tools/m2_profile_selector.py), работающая напрямую с файловой системой и корректно обрабатывающая кодировки `cp1251` / `utf-16le`.
+В качестве нативной замены для macOS / Linux / Windows создана утилита [`tools/m2_profile_selector.py`](file://./tools/m2_profile_selector.py), работающая напрямую с файловой системой и корректно обрабатывающая кодировки `cp1251` / `utf-16le`.
 
 ---
 
@@ -273,7 +273,7 @@
 
 ## 5. Производительность и устранение лагов Majesty 2 (Engine + Configs + Binary Hooks)
 
-Несмотря на то, что Majesty 2 вышла в 2009 году, на современных ПК и особенно на macOS с процессорами Apple Silicon (через CrossOver / Wine / Rosetta 2) игра страдает от тяжёлых просадок FPS в средних и поздних миссиях, микрофризов при вращении камеры и статтеров симуляции.
+Несмотря на то, что Majesty 2 вышла в 2009 году, на современных ПК и особенно на macOS с процессорами Apple Silicon (через Wine/Whisky / Wine / Rosetta 2) игра страдает от тяжёлых просадок FPS в средних и поздних миссиях, микрофризов при вращении камеры и статтеров симуляции.
 
 Проведённый бинарный аудит всех 44 модулей выявил **4 фундаментальные инженерные причины** этих тормозов, ни одна из которых ранее не описывалась в публичных гайдах.
 
@@ -320,7 +320,7 @@
 
 - На трансформацию **одного** AABB (`eBoxGeneric<Vec3>`) тратится **140 инструкций `x87 FPU`** и **9 внешних вызовов `call 0x10002790` (`fabsf`)** с выгрузкой аргументов из FPU-стека в оперативную память (`fstp dword ptr [esp]`)!
 - В функции отсечения по пирамиде видимости `?Intersecting@xGeometry@@YA_NABVeFrustum@1@ABV?$eBoxGeneric@UVec3@@@1@@Z` (**`VA 0x100151B0`**) выполняется **135 инструкций `x87`** с регулярной выгрузкой регистра состояния FPU в `AX` (`fnstsw ax; test ah, 0x41`), что полностью сбрасывает конвейер предсказания переходов современного CPU.
-- При трансляции через **Rosetta 2** на Apple Silicon 80-битный стек `x87` (`st(0)..st(7)`) с циклическим указателем вершины стека и инструкциями `fxch` / `fnstsw ax` не может отображаться 1-в-1 на плоские 64-битные регистры ARM64 NEON и эмулируется программно с потерей производительности в **5–8 раз**. Замена этих функций на `SSE2` в нашем ускорителе [`patches/gem3_perf_accelerator.cpp`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/patches/gem3_perf_accelerator.cpp) сокращает `Xform(eBox3, Matrix34)` со 140 `x87`-инструкций и 9 `call` до **22 регистровых инструкций `SSE2` без единого перехода и вызова функций**.
+- При трансляции через **Rosetta 2** на Apple Silicon 80-битный стек `x87` (`st(0)..st(7)`) с циклическим указателем вершины стека и инструкциями `fxch` / `fnstsw ax` не может отображаться 1-в-1 на плоские 64-битные регистры ARM64 NEON и эмулируется программно с потерей производительности в **5–8 раз**. Замена этих функций на `SSE2` в нашем ускорителе [`patches/gem3_perf_accelerator.cpp`](file://./patches/gem3_perf_accelerator.cpp) сокращает `Xform(eBox3, Matrix34)` со 140 `x87`-инструкций и 9 `call` до **22 регистровых инструкций `SSE2` без единого перехода и вызова функций**.
 
 ---
 
@@ -471,9 +471,9 @@ m2TimeBetweenQuantReports  0.0
 
 ### Готовый пакет исправлений и ускоритель в каталоге `patches/`
 
-Все разработанные исправления собраны в каталоге [`patches/`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/patches/):
+Все разработанные исправления собраны в каталоге [`patches/`](file://./patches/):
 
-1. **[`patches/gem3_perf_accelerator.cpp`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/patches/gem3_perf_accelerator.cpp)** — исходный код нативного `SSE2`-ускорителя и бинарного патчера памяти:
+1. **[`patches/gem3_perf_accelerator.cpp`](file://./patches/gem3_perf_accelerator.cpp)** — исходный код нативного `SSE2`-ускорителя и бинарного патчера памяти:
    - Перехватывает (`JMP rel32`) самые тяжёлые `x87`-функции `geometry.dll`:
      - `xGeometry::Xform(eBoxGeneric<Vec3>&, const Matrix34&)` (`VA 0x1001F940`)
      - `xGeometry::Construct(eBoxGeneric<Vec3>*, const eBoxGeneric<Vec3>&, const Matrix34&)` (`VA 0x10013CF0`)
@@ -481,9 +481,9 @@ m2TimeBetweenQuantReports  0.0
      - `Vec3::Xform(const Matrix33&)` (`VA 0x1000EBA0`)
      - `xGeometry::Intersecting(const eFrustum&, const eBoxGeneric<Vec3>&)` (`VA 0x100151B0`)
    - Программно патчит в памяти `render.dll` (`dbg_occlusionWaitResult = 0`, `r_FogmapDisableSystemCopy = 1`), `scene.dll` (`ed_alwaysEnableLandEditor = 0`, `r_grassCull = 1`) и `Multiplayer.dll` (`m2TimeBetweenQuantReports = 0.033f`, `m2TimeBetweenQuantCommands = 0.033f`).
-2. **[`patches/configs/`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/patches/configs/)**:
-   - [`developer.con`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/patches/configs/developer.con) — исправленный конфиг инициализации рендера и сцены.
-   - [`m2GameConst.con`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/patches/configs/m2GameConst.con) — исправленные тайминги квантов симуляции (`0.033`).
-   - [`grass.set`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/patches/configs/grass.set) — оптимизированная плотность травы (`{dencity 1}`).
-   - [`lod_classes.set`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/patches/configs/lod_classes.set) — корректный файл классов LOD в нижнем регистре для `scene.dll`.
-3. **[`patches/resource_patch_optimized.pak`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/patches/resource_patch_optimized.pak)** и скрипт сборки **[`patches/apply_resource_patch_fix.py`](file:///Users/orkodav4421/.gemini/antigravity/scratch/majesty2-re/patches/apply_resource_patch_fix.py)** — готовый пересобранный архив `resource_patch.pak` с интегрированными конфигурационными исправлениями.
+2. **[`patches/configs/`](file://./patches/configs/)**:
+   - [`developer.con`](file://./patches/configs/developer.con) — исправленный конфиг инициализации рендера и сцены.
+   - [`m2GameConst.con`](file://./patches/configs/m2GameConst.con) — исправленные тайминги квантов симуляции (`0.033`).
+   - [`grass.set`](file://./patches/configs/grass.set) — оптимизированная плотность травы (`{dencity 1}`).
+   - [`lod_classes.set`](file://./patches/configs/lod_classes.set) — корректный файл классов LOD в нижнем регистре для `scene.dll`.
+3. **[`patches/resource_patch_optimized.pak`](file://./patches/resource_patch_optimized.pak)** и скрипт сборки **[`patches/apply_resource_patch_fix.py`](file://./patches/apply_resource_patch_fix.py)** — готовый пересобранный архив `resource_patch.pak` с интегрированными конфигурационными исправлениями.
