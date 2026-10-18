@@ -8,3 +8,12 @@ EXPORTS
     D3DPERF_QueryRepeatFrame
     D3DPERF_SetOptions
     D3DPERF_GetStatus
+    m2_rust_cull_aabb_sse2
+    m2_rust_cull_sphere_sse2
+    m2_rust_state_filter
+    m2_rust_state_filter_reset
+    m2_rust_pace_compute_target_us
+    m2_rust_pace_reset
+    m2_rust_batch_transform_mat34_sse4
+    m2_rust_batch_transform_mat44_sse4
+    m2_rust_batch_rotate_quat_sse4

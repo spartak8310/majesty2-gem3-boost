@@ -558,8 +558,11 @@ static HRESULT STDMETHODCALLTYPE Hook_EndStateBlock(void* dev, P ppSB) {
 }
 
 typedef TimedHook<57, B_STATE, D, D> HSetRS;
+static inline bool M2_CanUseStateCache(void) {
+    return !g_sbRecording && (!g_dcEnabled || !g_renderTid || GetCurrentThreadId() == g_renderTid);
+}
 static HRESULT STDMETHODCALLTYPE Hook_SetRenderState(void* dev, D state, D val) {
-    if (!g_sbRecording && state < 256u && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+    if (state < 256u && M2_CanUseStateCache()) {
         if (g_rsValid[state] && g_rsVal[state] == val) {
             g_stateCacheHits++;
             return S_OK;
@@ -574,7 +577,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetRenderState(void* dev, D state, D val) 
 
 typedef TimedHook<67, B_STATE, D, D, D> HSetTSS;
 static HRESULT STDMETHODCALLTYPE Hook_SetTextureStageState(void* dev, D stage, D type, D val) {
-    if (!g_sbRecording && stage < 8u && type < 36u && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+    if (stage < 8u && type < 36u && M2_CanUseStateCache()) {
         if (g_tssValid[stage][type] && g_tssVal[stage][type] == val) {
             g_stateCacheHits++;
             return S_OK;
@@ -592,7 +595,7 @@ static inline int M2_GetHdrMode(void);
 static inline void M2_OnAnisoUpgrade(void);
 
 static inline HRESULT M2_ApplySamplerStateFiltered(void* dev, D samp, D type, D val) {
-    if (!g_sbRecording && samp < 16u && type < 16u && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+    if (samp < 16u && type < 16u && M2_CanUseStateCache()) {
         if (g_ssValid[samp][type] && g_ssVal[samp][type] == val) {
             g_stateCacheHits++;
             return S_OK;
@@ -625,7 +628,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetSamplerState(void* dev, D samp, D type,
 
 typedef TimedHook<65, B_STATE, D, P> HSetTexture;
 static HRESULT STDMETHODCALLTYPE Hook_SetTexture(void* dev, D stage, P pTexture) {
-    if (!g_sbRecording && stage < 16u && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+    if (stage < 16u && M2_CanUseStateCache()) {
         if (g_texValid[stage] && g_texVal[stage] == pTexture) {
             g_stateCacheHits++;
             return S_OK;
@@ -640,7 +643,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetTexture(void* dev, D stage, P pTexture)
 
 typedef TimedHook<87, B_STATE, P> HSetVDecl;
 static HRESULT STDMETHODCALLTYPE Hook_SetVertexDeclaration(void* dev, P pDecl) {
-    if (!g_sbRecording && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+    if (M2_CanUseStateCache()) {
         if (g_vdeclValid && g_vdeclVal == pDecl) {
             g_stateCacheHits++;
             return S_OK;
@@ -656,7 +659,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexDeclaration(void* dev, P pDecl) {
 
 typedef TimedHook<89, B_STATE, D> HSetFVF;
 static HRESULT STDMETHODCALLTYPE Hook_SetFVF(void* dev, D fvf) {
-    if (!g_sbRecording && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+    if (M2_CanUseStateCache()) {
         if (g_fvfValid && g_fvfVal == fvf) {
             g_stateCacheHits++;
             return S_OK;
@@ -672,7 +675,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetFVF(void* dev, D fvf) {
 
 typedef TimedHook<92, B_STATE, P> HSetVS;
 static HRESULT STDMETHODCALLTYPE Hook_SetVertexShader(void* dev, P pShader) {
-    if (!g_sbRecording && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+    if (M2_CanUseStateCache()) {
         if (g_vsValid && g_vsVal == pShader) {
             g_stateCacheHits++;
             return S_OK;
@@ -687,7 +690,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShader(void* dev, P pShader) {
 
 typedef TimedHook<107, B_STATE, P> HSetPS;
 static HRESULT STDMETHODCALLTYPE Hook_SetPixelShader(void* dev, P pShader) {
-    if (!g_sbRecording && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+    if (M2_CanUseStateCache()) {
         if (g_psValid && g_psVal == pShader) {
             g_stateCacheHits++;
             return S_OK;
@@ -1357,10 +1360,9 @@ static void InstallAllocHooks(void) {
     static bool done = false;
     if (done) return;
     char aev[16] = {0};
-    if (!(GetEnvironmentVariableA("M2_ARENA", aev, sizeof(aev)) > 0)) {
-        // W3b: arena fully disabled by default (no alloc/free hooks at all).
+    if (GetEnvironmentVariableA("M2_ARENA", aev, sizeof(aev)) > 0 && (aev[0] == '0' || !_stricmp(aev, "off"))) {
         done = true;
-        LogLine("arena: disabled by default (set M2_ARENA=0 for counters, =1 for serving)");
+        LogLine("arena: disabled by M2_ARENA=0");
         return;
     }
     M2ArenaInit();
@@ -6626,7 +6628,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
     // soon as the cadence target allows.
     int gate = 1;                              // 1 = call the real Present (stock behaviour)
     uint32_t sinceDraws = 0;
-    if ((g_r3LimitHz || g_r3MinDraws) && g_qpcFreq.QuadPart != 0) {
+    if (!g_m2Unlock120Installed && (g_r3LimitHz || g_r3MinDraws) && g_qpcFreq.QuadPart != 0) {
         sinceDraws = g_r3Draws - g_r3DrawsAtP;
         if (!g_r3Armed && g_r3MinDraws > 0 && g_lastFrame.QuadPart != 0 &&
             sinceDraws >= (uint32_t)g_r3MinDraws) {

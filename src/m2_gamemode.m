@@ -61,15 +61,91 @@ static BOOL m2_is_game_window(NSWindow *w) {
            (f.size.width >= s.size.width * 0.80 && f.size.height >= s.size.height * 0.80);
 }
 
+#include <math.h>
+
+static CATextLayer *m2_hud_text_layer = nil;
+
+static void m2_update_dual_fps_overlay(NSView *cv) {
+    if (!cv) return;
+    const char *hud_opt = getenv("M2_FAST_HUD");
+    if (hud_opt && (strcmp(hud_opt, "0") == 0 || strcmp(hud_opt, "off") == 0)) {
+        if (m2_hud_text_layer) {
+            m2_hud_text_layer.hidden = YES;
+        }
+        return;
+    }
+    if (!cv.wantsLayer) {
+        cv.wantsLayer = YES;
+    }
+    CALayer *root = cv.layer;
+    if (!root) return;
+
+    FILE *f = fopen("/tmp/m2_hud_live.txt", "rb");
+    if (!f) return;
+    char buf[512];
+    memset(buf, 0, sizeof(buf));
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) return;
+    // Strip trailing newline
+    for (size_t i = 0; i < n; ++i) {
+        if (buf[i] == '\r' || buf[i] == '\n') {
+            buf[i] = '\0';
+            break;
+        }
+    }
+    NSString *line = [NSString stringWithUTF8String:buf];
+    if (!line || line.length == 0) return;
+
+    if (!m2_hud_text_layer) {
+        m2_hud_text_layer = [CATextLayer layer];
+        m2_hud_text_layer.name = @"M2DualFpsOverlay";
+        m2_hud_text_layer.zPosition = 9999.0;
+        m2_hud_text_layer.contentsScale = 2.0;
+        m2_hud_text_layer.font = (__bridge CFTypeRef)[NSFont monospacedSystemFontOfSize:11.5 weight:NSFontWeightBold];
+        m2_hud_text_layer.fontSize = 11.5;
+        m2_hud_text_layer.foregroundColor = [NSColor colorWithCalibratedRed:0.35 green:1.0 blue:0.65 alpha:1.0].CGColor;
+        m2_hud_text_layer.backgroundColor = [NSColor colorWithCalibratedRed:0.04 green:0.06 blue:0.10 alpha:0.82].CGColor;
+        m2_hud_text_layer.cornerRadius = 5.0;
+        m2_hud_text_layer.alignmentMode = kCAAlignmentCenter;
+        m2_hud_text_layer.wrapped = NO;
+        // Disable implicit animations
+        m2_hud_text_layer.actions = @{
+            @"contents": [NSNull null],
+            @"string": [NSNull null],
+            @"bounds": [NSNull null],
+            @"position": [NSNull null]
+        };
+    }
+    if (m2_hud_text_layer.superlayer != root) {
+        [m2_hud_text_layer removeFromSuperlayer];
+        [root addSublayer:m2_hud_text_layer];
+    }
+    m2_hud_text_layer.hidden = NO;
+    m2_hud_text_layer.string = [NSString stringWithFormat:@"  %@  ", line];
+
+    NSRect b = cv.bounds;
+    CGFloat barW = fmin(b.size.width - 24.0, 980.0);
+    CGFloat barH = 22.0;
+    // Place at top-left (y near top in default unflipped NSView coordinates, or top in flipped)
+    CGFloat barY = cv.isFlipped ? 8.0 : (b.size.height - barH - 8.0);
+    m2_hud_text_layer.frame = CGRectMake(12.0, barY, barW, barH);
+}
+
 static void m2_configure_metalfx_layer_recursive(CALayer *layer, CGFloat targetScale) {
-    if (!layer) return;
+    if (!layer || layer == m2_hud_text_layer) return;
     if ([layer isKindOfClass:[CAMetalLayer class]]) {
         CAMetalLayer *ml = (CAMetalLayer *)layer;
-        if (ml.contentsScale != targetScale) {
+        CGSize boundsSize = ml.bounds.size;
+        CGSize targetDrawable = CGSizeMake(boundsSize.width * targetScale, boundsSize.height * targetScale);
+        BOOL scaleChanged = (fabs(ml.contentsScale - targetScale) > 0.01);
+        BOOL drawableChanged = (boundsSize.width >= 800.0 && boundsSize.height >= 600.0) &&
+                               (fabs(ml.drawableSize.width - targetDrawable.width) > 1.0 ||
+                                fabs(ml.drawableSize.height - targetDrawable.height) > 1.0);
+        if (scaleChanged || drawableChanged) {
             ml.contentsScale = targetScale;
-            CGSize boundsSize = ml.bounds.size;
             if (boundsSize.width >= 800.0 && boundsSize.height >= 600.0) {
-                ml.drawableSize = CGSizeMake(boundsSize.width * targetScale, boundsSize.height * targetScale);
+                ml.drawableSize = targetDrawable;
             }
             NSLog(@"[M2-GameMode] Configured CAMetalLayer %p for MetalFX Retina %.1fx (bounds=%.0fx%.0f -> drawable=%.0fx%.0f)",
                   ml, targetScale, boundsSize.width, boundsSize.height, ml.drawableSize.width, ml.drawableSize.height);
@@ -95,6 +171,8 @@ static void m2_sync_window_geometry_and_metalfx(NSWindow *w) {
     if (!NSEqualRects(cv.frame, desiredBounds)) {
         cv.frame = desiredBounds;
     }
+
+    m2_update_dual_fps_overlay(cv);
 
     const char *no_mfx = getenv("M2_NO_METALFX");
     if (no_mfx && no_mfx[0] == '1') return;
