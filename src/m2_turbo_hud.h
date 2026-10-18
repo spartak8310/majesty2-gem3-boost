@@ -37,10 +37,17 @@ static void* g_m2LastDevice = NULL;
 static int g_m2CachedW = 0;
 static int g_m2CachedH = 0;
 static DWORD g_m2CachedFmt = 0;
-static int g_m2CachedValid = 0;
+// g_m2CachedValid and g_m2PostLoadWarmup forward-declared in d3d9_proxy.cpp
 // Render-skip pacing (Quant runs every tick when <9ms; RenderScreen is independently decoupled 1:K)
 static int g_m2RenderPhase = 0;
+static int g_m2RenderSkipK = 4;
 static double g_m2LastRenderMs = 0.0;
+static double s_emaRealRenderMs = 0.0;
+static int g_m2LastEffK = 1;
+static volatile uint32_t g_m2RealFrames = 0;
+static volatile uint32_t g_m2ReplayFrames = 0;
+static uint32_t g_m2RealFramesLastSec = 0;
+static uint32_t g_m2ReplayFramesLastSec = 0;
 static LARGE_INTEGER g_m2QpcFreq = {0};
 
 // 120 FPS Unlocker state (app.dll Sleep(3)->NOP + pro_sleepRender=0 + r_waitForRenderDone=0 + VSync OFF + RenderScreen Hook)
@@ -66,28 +73,33 @@ static inline double M2_QpcMs(void) {
     return (double)t.QuadPart * 1000.0 / (double)g_m2QpcFreq.QuadPart;
 }
 
-// K = render every K-th tick, chosen so q + r/K + 1.5 <= 8.33ms
+// Adaptive real-frame skip factor effK
 static inline int M2_RenderSkipK(void) {
-    if (g_m2DecoupleMode <= 0) return 1;
-    if (g_m2LastRenderMs <= 0.1) return 4;
-    double budget = 8.33 - 1.5 - g_m2LastRealQuantMs;
-    if (budget < 0.8) budget = 0.8;
-    int k = (int)ceil(g_m2LastRenderMs / budget);
-    int kmax = (g_m2DecoupleMode == 2) ? 10 : 6;
-    if (k < 3 && g_m2DecoupleMode >= 1) k = 3;
-    return (k < 1) ? 1 : (k > kmax ? kmax : k);
+    if (g_m2PostLoadWarmup > 0 || !g_levelUp || g_m2DecoupleMode <= 0) return 1;
+    if (g_m2DecoupleMode == 1) {
+        if (s_emaRealRenderMs <= 6.5) return 1;
+        if (s_emaRealRenderMs <= 13.0) return 2;
+        if (s_emaRealRenderMs <= 20.0) return 3;
+        return g_m2RenderSkipK;
+    }
+    if (s_emaRealRenderMs <= 5.0) return 1;
+    if (s_emaRealRenderMs <= 10.0) return 2;
+    if (s_emaRealRenderMs <= 16.0) return 3;
+    return g_m2RenderSkipK;
 }
 
 static void __fastcall M2_HookedRenderScreen(void* thisPtr, void* edx) {
     (void)edx;
     if (g_m2PostLoadWarmup > 0) g_m2PostLoadWarmup--;
+    int effK = M2_RenderSkipK();
+    g_m2LastEffK = effK;
     int canReplay = g_levelUp && g_m2PostLoadWarmup <= 0 && g_m2CachedValid &&
-                    g_m2CachedSurf != NULL && g_m2LastDevice != NULL && g_m2DecoupleMode > 0;
+                    g_m2CachedSurf != NULL && g_m2LastDevice != NULL && g_m2DecoupleMode > 0 && effK > 1;
     if (canReplay) {
-        int k = M2_RenderSkipK();
-        if (g_m2SubFrameSkipRender || (++g_m2RenderPhase < k)) {
+        if (g_m2SubFrameSkipRender || (++g_m2RenderPhase < effK)) {
             g_m2DidSkipRenderRC = 1;
             g_m2DecoupleSkippedRenders++;
+            g_m2ReplayFrames++;
             Hook_Present(g_m2LastDevice, NULL, NULL, NULL, NULL);
             g_m2DidSkipRenderRC = 0;
             g_m2SubFrameSkipRender = 0;
@@ -97,6 +109,7 @@ static void __fastcall M2_HookedRenderScreen(void* thisPtr, void* edx) {
     g_m2RenderPhase = 0;
     g_m2SubFrameSkipRender = 0;
     g_m2DidSkipRenderRC = 0;
+    g_m2RealFrames++;
     double t0 = M2_QpcMs();
     if (g_m2RealRenderScreen) {
         g_m2RealRenderScreen(thisPtr);
@@ -105,8 +118,12 @@ static void __fastcall M2_HookedRenderScreen(void* thisPtr, void* edx) {
         ((PFN_M2RealRenderScreen)vtbl[5])(thisPtr);
     }
     double r = M2_QpcMs() - t0;
-    if (r > 0.05 && r < 200.0) {
-        g_m2LastRenderMs = (g_m2LastRenderMs <= 0.1) ? r : (g_m2LastRenderMs * 0.8 + r * 0.2);
+    if (r > 80.0) {
+        g_m2PostLoadWarmup = 180;
+        g_m2CachedValid = 0;
+    } else if (r > 0.05 && r < 200.0) {
+        s_emaRealRenderMs = (s_emaRealRenderMs <= 0.1) ? r : (s_emaRealRenderMs * 0.8 + r * 0.2);
+        g_m2LastRenderMs = s_emaRealRenderMs;
     }
 }
 
@@ -382,8 +399,9 @@ static inline int M2_DecoupleFilterQuant(int levelUp, int fdtMs, int detOn, int 
 
 static inline void M2_DecoupleRecordQuantMs(double q_ms) {
     if (q_ms > 60.0) {
-        // Load-type spike: hold off render replay briefly, but keep the cost estimate
-        if (g_m2PostLoadWarmup < 30) g_m2PostLoadWarmup = 30;
+        // Load-type spike: hold off render replay for 180 frames and invalidate cached surface
+        g_m2PostLoadWarmup = 180;
+        g_m2CachedValid = 0;
     } else {
         g_m2LastRealQuantMs = (g_m2LastRealQuantMs <= 0.1) ? q_ms : (g_m2LastRealQuantMs * 0.7 + q_ms * 0.3);
     }
@@ -483,15 +501,14 @@ static inline void M2_TurboHud_RefreshTitleNow(void) {
     if (!M2_TurboHud_IsEnabled()) return;
     HWND wnd = g_m2HudWnd;
     if (!wnd || !IsWindow(wnd)) return;
-    char title[320];
+    char title[352];
     snprintf(title, sizeof(title),
-             "Majesty 2 [TURBO v10 120Hz] | %.1f FPS (%.1fms) | Quant: %.1fms (%.1fx) | [F8] %s | [F9] SSE2:%s | [F10] Decouple:%s(skip:%u/%u) | [F11] Cam:%s",
-             g_m2LastFps, g_m2LastAvgMs, g_m2LastQuantMs, g_m2LastGameX > 0.0 ? g_m2LastGameX : 1.0,
+             "Majesty 2 [TURBO v10 120Hz] | %.1f FPS (real:%u rep:%u K:%d) | Quant: %.1fms (%.1fx) | [F8] %s | [F9] SSE2:%s | [F10] Decouple:%s | [F11] Cam:%s",
+             g_m2LastFps, g_m2RealFramesLastSec, g_m2ReplayFramesLastSec, g_m2LastEffK,
+             g_m2LastQuantMs, g_m2LastGameX > 0.0 ? g_m2LastGameX : 1.0,
              M2_HdrModeName(g_m2HdrMode),
              g_w6LiveEnabled ? "ON(13)" : "OFF",
              M2_DecoupleModeName(g_m2DecoupleMode),
-             g_m2DecoupleSkippedLastSec,
-             g_m2DecoupleSkippedRendersLastSec,
              g_r3Cam ? "ON" : "OFF");
     SetWindowTextA(wnd, title);
 }
@@ -505,8 +522,8 @@ static inline void M2_TurboHud_PollHotkeys(void* pDevice) {
     }
     M2_TurboHud_DrawToast(pDevice);
     if (!M2_TurboHud_IsEnabled()) return;
-    static uint32_t s_pollDiv = 0;
-    if ((++s_pollDiv & 3u) != 0) return;
+    static uint32_t s_hkTick = 0;
+    if ((s_hkTick++ & 7) != 0) return;
 
     const int vks[5] = { VK_F8, VK_F9, VK_F10, VK_F11, VK_F12 };
     for (int i = 0; i < 5; ++i) {
@@ -567,20 +584,27 @@ static inline void M2_TurboHud_UpdateSec(void* pDevice, double total_el, double 
     g_m2LastGameX = game_x;
     uint32_t sk = g_m2DecoupleSkipped;
     uint32_t skr = g_m2DecoupleSkippedRenders;
+    uint32_t rf = g_m2RealFrames;
+    uint32_t repf = g_m2ReplayFrames;
     uint32_t an = g_m2AnisoUpgrades;
     g_m2DecoupleSkipped = 0;
     g_m2DecoupleSkippedRenders = 0;
+    g_m2RealFrames = 0;
+    g_m2ReplayFrames = 0;
     g_m2AnisoUpgrades = 0;
     g_m2DecoupleSkippedLastSec = sk;
     g_m2DecoupleSkippedRendersLastSec = skr;
+    g_m2RealFramesLastSec = rf;
+    g_m2ReplayFramesLastSec = repf;
     if (g_m2HdrMode == 1 || g_m2HdrMode == 2) {
         M2_TurboHud_ApplyHdrRamp(pDevice);
     }
     if (g_logFile != INVALID_HANDLE_VALUE) {
-        char line[280];
+        char line[384];
         int len = snprintf(line, sizeof(line),
-                           "# turbo_v8 t=%.2f fps=%.1f hdr_mode=%d(%s) aniso_upgrades=%u decouple_mode=%d(%s) decouple_skipped_quants=%u decouple_skipped_renders=%u last_real_quant_ms=%.2f unlock120=%d\n",
-                           total_el, fps, g_m2HdrMode, M2_HdrModeName(g_m2HdrMode), an,
+                           "# turbo_v8 [M2-TURBO-V10] t=%.2f fps=%.1f real_frames=%u replay_frames=%u effK=%d ema_render_ms=%.2f warmup=%d level_up=%d hdr_mode=%d(%s) aniso_upgrades=%u decouple_mode=%d(%s) decouple_skipped_quants=%u decouple_skipped_renders=%u last_real_quant_ms=%.2f unlock120=%d\n",
+                           total_el, fps, rf, repf, g_m2LastEffK, s_emaRealRenderMs, g_m2PostLoadWarmup, (int)g_levelUp,
+                           g_m2HdrMode, M2_HdrModeName(g_m2HdrMode), an,
                            g_m2DecoupleMode, M2_DecoupleModeName(g_m2DecoupleMode), sk, skr, g_m2LastRealQuantMs, g_m2Unlock120Installed);
         if (len > 0) {
             DWORD w = 0;

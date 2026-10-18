@@ -110,6 +110,16 @@ static HANDLE g_logFile = INVALID_HANDLE_VALUE;
 static uint32_t g_secFrameUs[4096];
 static uint32_t g_secFrameCount = 0;
 static uint32_t g_totalFrames = 0;
+static uint32_t g_ftBuf[256];
+static uint32_t g_ftBufCount = 0;
+
+static inline void FlushFtBuf(void) {
+    if (g_ftBufCount > 0 && g_ftFile != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(g_ftFile, g_ftBuf, (DWORD)(g_ftBufCount * sizeof(uint32_t)), &written, NULL);
+    }
+    g_ftBufCount = 0;
+}
 
 static void InitSensorFiles(void) {
     if (g_qpcFreq.QuadPart != 0) return;
@@ -345,12 +355,21 @@ static void LogLine(const char* msg);
 // the draw, which lands inside the particle paint function when particles are being drawn.
 static void M2_PfUpEvidence(void* retaddr, unsigned int primCount, unsigned int stride);
 
+static inline void AccountSampled(int b, int64_t t0) {
+    g_bucketTicks[b] += (Qpc() - t0) * 64LL;
+    if (g_renderTid && GetCurrentThreadId() != g_renderTid) g_foreignCalls += 64;
+}
+
+static uint32_t g_qpcDrawSample = 0;
+
 static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitive(void* pDevice, DWORD type, UINT startVertex, UINT primCount) {
     g_draws++; g_prims += primCount;
     if (g_r3MinDraws) g_r3Draws++;   // Wave 3: monotonic, telemetry-proof
+    g_bucketCalls[B_DRAW]++;
+    if ((g_qpcDrawSample++ & 63u) != 0) return g_origDrawPrimitive(pDevice, type, startVertex, primCount);
     int64_t t0 = Qpc();
     HRESULT hr = g_origDrawPrimitive(pDevice, type, startVertex, primCount);
-    Account(B_DRAW, t0);
+    AccountSampled(B_DRAW, t0);
     return hr;
 }
 
@@ -359,9 +378,12 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitive(void* pDevice, DWORD 
     if (g_pfEvOn) M2_PfUpEvidence(__builtin_return_address(0), primCount, 0);
     g_draws++; g_prims += primCount;
     if (g_r3MinDraws) g_r3Draws++;   // Wave 3: monotonic, telemetry-proof
+    g_bucketCalls[B_DRAW]++;
+    if ((g_qpcDrawSample++ & 63u) != 0)
+        return g_origDrawIndexedPrimitive(pDevice, type, baseVertex, minIndex, numVertices, startIndex, primCount);
     int64_t t0 = Qpc();
     HRESULT hr = g_origDrawIndexedPrimitive(pDevice, type, baseVertex, minIndex, numVertices, startIndex, primCount);
-    Account(B_DRAW, t0);
+    AccountSampled(B_DRAW, t0);
     return hr;
 }
 
@@ -370,9 +392,11 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitiveUP(void* pDevice, DWORD type,
     if (g_pfEvOn) M2_PfUpEvidence(__builtin_return_address(0), primCount, stride);
     g_draws++; g_upDraws++; g_prims += primCount;
     if (g_r3MinDraws) g_r3Draws++;   // Wave 3: monotonic, telemetry-proof
+    g_bucketCalls[B_DRAW]++;
+    if ((g_qpcDrawSample++ & 63u) != 0) return g_origDrawPrimitiveUP(pDevice, type, primCount, vertexData, stride);
     int64_t t0 = Qpc();
     HRESULT hr = g_origDrawPrimitiveUP(pDevice, type, primCount, vertexData, stride);
-    Account(B_DRAW, t0);
+    AccountSampled(B_DRAW, t0);
     return hr;
 }
 
@@ -381,10 +405,14 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitiveUP(void* pDevice, DWOR
                                                              const void* vertexData, UINT stride) {
     g_draws++; g_upDraws++; g_prims += primCount;
     if (g_r3MinDraws) g_r3Draws++;   // Wave 3: monotonic, telemetry-proof
+    g_bucketCalls[B_DRAW]++;
+    if ((g_qpcDrawSample++ & 63u) != 0)
+        return g_origDrawIndexedPrimitiveUP(pDevice, type, minIndex, numVertices, primCount, indexData, indexFormat,
+                                            vertexData, stride);
     int64_t t0 = Qpc();
     HRESULT hr = g_origDrawIndexedPrimitiveUP(pDevice, type, minIndex, numVertices, primCount, indexData, indexFormat,
                                               vertexData, stride);
-    Account(B_DRAW, t0);
+    AccountSampled(B_DRAW, t0);
     return hr;
 }
 
@@ -395,9 +423,12 @@ struct TimedHook {
     typedef HRESULT (STDMETHODCALLTYPE *Fn)(void*, A...);
     static Fn orig;
     static HRESULT STDMETHODCALLTYPE Hook(void* self, A... a) {
+        g_bucketCalls[B]++;
+        static uint32_t s_qpcSample = 0;
+        if ((s_qpcSample++ & 63u) != 0) return orig(self, a...);
         int64_t t0 = Qpc();
         HRESULT hr = orig(self, a...);
-        Account(B, t0);
+        AccountSampled(B, t0);
         return hr;
     }
 };
@@ -568,7 +599,7 @@ static void LogLine(const char* msg) {
     int len = snprintf(line, sizeof(line), "# %s\n", msg);
     DWORD w = 0;
     if (len > 0) WriteFile(g_logFile, line, (DWORD)len, &w, NULL);
-    FlushFileBuffers(g_logFile);
+    if (g_totalFrames < 10) FlushFileBuffers(g_logFile);
 }
 
 // ---- M2_ARENA_BEGIN ----
@@ -1228,6 +1259,8 @@ typedef float (__thiscall *PFN_QcFloat)(void* self);
 static PFN_QcGet g_qcGet = NULL;
 static PFN_QcFloat g_qcSpeed = NULL, g_qcSpeedScale = NULL;
 static bool g_levelUp = false;
+static int g_m2PostLoadWarmup = 180;
+static int g_m2CachedValid = 0;
 static bool g_autostart = false;
 static LARGE_INTEGER g_levelUpTick = {0};  // QPC when SecondUpdate was seen
 static LARGE_INTEGER g_speed5Tick = {0};   // QPC when 5x SpeedScale actually became active
@@ -1523,6 +1556,8 @@ static void AutoStartTick(const LARGE_INTEGER& now) {
         if (DebugLogHas("GameStateLevel::SecondUpdate started in")) {
             LogLine("autostart: SecondUpdate seen -> watching for Advisor / M2MessageBox dialogs");
             g_levelUp = true;
+            g_m2PostLoadWarmup = 180;
+            g_m2CachedValid = 0;
             g_levelUpTick = now;
             LogModules("level");
             state = 5; stamp = now;
@@ -3442,7 +3477,10 @@ extern "C" void __cdecl M2_CameraFrustumEye(float* out3) {
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_SetTransform(void* pDevice, DWORD state, const void* pMatrix) {
-    int64_t t0 = Qpc();
+    g_bucketCalls[B_STATE]++;
+    static uint32_t s_qpcStSample = 0;
+    const bool sampleQpc = ((s_qpcStSample++ & 63u) == 0);
+    int64_t t0 = sampleQpc ? Qpc() : 0;
     const int isView = (state == 2), isProj = (state == 3);
     if (pMatrix && isView) memcpy(g_capView, pMatrix, 64);
     else if (pMatrix && isProj) memcpy(g_capProj, pMatrix, 64);
@@ -3479,7 +3517,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetTransform(void* pDevice, DWORD state, c
     } else {
         g_stOther++;
     }
-    Account(B_STATE, t0);
+    if (sampleQpc) AccountSampled(B_STATE, t0);
     return hr;
 }
 
@@ -4841,7 +4879,7 @@ static void M2_PfTelemetry(double tSec) {
 #include "m2_quant_distributor.h"
 #include "m2_pather_sse2.h"
 
-static int g_m2PostLoadWarmup = 120;
+// g_m2PostLoadWarmup and g_m2CachedValid declared above alongside g_levelUp
 static double g_m2LastRealQuantMs = 0.0;
 static inline int M2_DecoupleFilterQuant(int levelUp, int fdtMs, int detOn, int ms, int* outEffMs);
 static inline void M2_DecoupleRecordQuantMs(double qMs);
@@ -4892,7 +4930,8 @@ static void __fastcall Hook_AppQuant(void* self, void* edx, int ms) {
     if (g_qpcFreq.QuadPart != 0) {
         double q_ms = (double)dtQuantTicks * 1000.0 / (double)g_qpcFreq.QuadPart;
         if (q_ms > 60.0) {
-            g_m2PostLoadWarmup = 120;
+            g_m2PostLoadWarmup = 180;
+            g_m2CachedValid = 0;
             g_m2LastRealQuantMs = 0.0;
         } else {
             g_m2LastRealQuantMs = (g_m2LastRealQuantMs <= 0.1) ? q_ms : (g_m2LastRealQuantMs * 0.7 + q_ms * 0.3);
@@ -6205,19 +6244,44 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
     g_inPresent = 0;
     if (gate && !dcOwnsSwap) g_presentTicks += Qpc() - tp0;
     AutoStartTick(now);
-    if (!g_zoneInstalled) M2_ZoneInstall();   // retried until scene.dll is loaded; idempotent + cheap
-    if (!g_pfDone) M2_PfInstall();            // Wave 2: retried until the pf module(s) load; idempotent + cheap
-    if (!g_qp.done) M2_QuantInstall();        // Splice 2: retried until scene.dll is loaded; idempotent + cheap
-    InstallQuantDistributorHook();             // Parallel distributor (5 P-cores)
+    static uint32_t s_installTick = 0, s_installTries = 0;
+    if ((s_installTick++ & 31u) == 0 && s_installTries < 64u) {
+        ++s_installTries;
+        if (!g_zoneInstalled) M2_ZoneInstall();   // retried until scene.dll is loaded; idempotent + cheap
+        if (!g_pfDone) M2_PfInstall();            // Wave 2: retried until the pf module(s) load; idempotent + cheap
+        if (!g_qp.done) M2_QuantInstall();        // Splice 2: retried until scene.dll is loaded; idempotent + cheap
+        InstallQuantDistributorHook();             // Parallel distributor (5 P-cores)
+        M2ArenaLateSweep();                        // Splice 1: free-family hooks for DLLs loaded after device creation
+    }
     ProfilerTick(now);
     if (!g_m2HudWnd && hDestWindowOverride) g_m2HudWnd = hDestWindowOverride;
     M2_TurboHud_OnPresent(pDevice);
-    if (!g_levelUp && (g_draws > 200 || (g_r3Draws - g_r3DrawsAtP) > 80)) {
-        g_levelUp = true;
-        QueryPerformanceCounter(&g_levelUpTick);
-        LogLine("golden_v9: normal gameplay 3D scene active -> latched g_levelUp=true");
+
+    static uint32_t s_prevFrameDraws = 0;
+    static uint32_t s_lowDrawFrames = 0;
+    static uint32_t s_sceneSecs = 0;
+    if (!g_m2DidSkipRenderRC) {
+        uint32_t curDraws = g_draws;
+        uint32_t frameDraws = (curDraws >= s_prevFrameDraws) ? (curDraws - s_prevFrameDraws) : curDraws;
+        s_prevFrameDraws = curDraws;
+        if (frameDraws < 80u) {
+            g_m2PostLoadWarmup = 180;
+            g_m2CachedValid = 0;
+            if (frameDraws < 50u) {
+                if (++s_lowDrawFrames >= 10u && g_levelUp) {
+                    g_levelUp = false;
+                    s_sceneSecs = 0;
+                    s_installTries = 0;
+                    LogLine("golden_v10: 2D loading/UI transition (10 frames <50 draws) -> reset g_levelUp=false, warmup=180");
+                }
+            } else {
+                s_lowDrawFrames = 0;
+            }
+        } else {
+            s_lowDrawFrames = 0;
+        }
     }
-    M2ArenaLateSweep();   // Splice 1: free-family hooks for DLLs loaded after device creation
+
     if (dcOwnsSwap) {
         // frame handed to the presenter thread: neither presented here nor skipped
     } else if (gate) {
@@ -6232,12 +6296,16 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
     // per-second line would have a zero frame count.  probe mode presents every frame, so it always reports.
     if (gate && g_lastFrame.QuadPart != 0 && g_qpcFreq.QuadPart != 0) {
         uint64_t dt_us = (uint64_t)((now.QuadPart - g_lastFrame.QuadPart) * 1000000ULL / g_qpcFreq.QuadPart);
+        if (dt_us > 80000ULL) {
+            g_m2PostLoadWarmup = 180;
+            g_m2CachedValid = 0;
+        }
         uint32_t us32 = (dt_us > 10000000ULL) ? 10000000U : (uint32_t)dt_us;
         g_totalFrames++;
 
-        if (g_ftFile != INVALID_HANDLE_VALUE) {
-            DWORD written = 0;
-            WriteFile(g_ftFile, &us32, sizeof(us32), &written, NULL);
+        g_ftBuf[g_ftBufCount++] = us32;
+        if (g_ftBufCount >= 256u) {
+            FlushFtBuf();
         }
         if (g_secFrameCount < 4096) {
             g_secFrameUs[g_secFrameCount++] = us32;
@@ -6271,12 +6339,25 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
             uint32_t arSrv = 0, arFre = 0, arFb = 0, arFrn = 0, arBad = 0, arChunks = 0;
             Ar_TelemetryReset(&arSrv, &arFre, &arFb, &arFrn, &arBad, &arChunks);
             g_draws = g_prims = g_upDraws = 0;
+            s_prevFrameDraws = 0;
             g_allocExe = g_allocScene = g_allocRender = 0;
             g_fastAstarCalls = g_fastAstarPops = g_fastAstarEarlyOuts = 0;
             g_fastSeePointCalls = g_fastSeePointPops = 0;
             g_fastAstarTicks = g_fastSeePointTicks = 0;
             uint32_t allocs = aExe + aScene + aRender;
             double nf = (double)g_secFrameCount;
+            double dpf = draws / nf;
+            if (dpf >= 150.0) {
+                if (++s_sceneSecs >= 3u && !g_levelUp) {
+                    g_levelUp = true;
+                    g_m2PostLoadWarmup = 180;
+                    g_m2CachedValid = 0;
+                    QueryPerformanceCounter(&g_levelUpTick);
+                    LogLine("golden_v10: sustained 3D scene (3s dpf>=150) -> latched g_levelUp=true (warmup=180)");
+                }
+            } else {
+                s_sceneSecs = 0;
+            }
             double tk2ms = 1000.0 / (double)g_qpcFreq.QuadPart;
             len = snprintf(line, sizeof(line),
                            "# telemetry t=%.2f frames=%u draws=%u prims=%u updraws=%u allocs=%u a_exe=%u a_scene=%u "
@@ -6338,6 +6419,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
             M2_TurboHud_UpdateSec(pDevice, total_el, fps, avg_ms, quantMs, gameX);
             M2_FrustumLiveSelfTest();
             if (g_ftFile != INVALID_HANDLE_VALUE) {
+                FlushFtBuf();
                 FlushFileBuffers(g_ftFile);
             }
             g_secFrameCount = 0;
@@ -6586,7 +6668,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
                     g_shadowCalls, g_shadowIdentical, g_shadowSameCost, g_shadowWorse, g_shadowFoundMismatch, g_shadowFastFoundOrigNot, g_shadowOrigFoundFastNot);
             if (len > 0) { DWORD wr=0; WriteFile(g_logFile, line, (DWORD)len, &wr, NULL); }
         }
-        if (g_ftFile != INVALID_HANDLE_VALUE) CloseHandle(g_ftFile);
+        if (g_ftFile != INVALID_HANDLE_VALUE) { FlushFtBuf(); CloseHandle(g_ftFile); }
         if (g_logFile != INVALID_HANDLE_VALUE) CloseHandle(g_logFile);
     }
     return TRUE;
