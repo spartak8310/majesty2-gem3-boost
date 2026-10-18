@@ -38,6 +38,10 @@ static int g_m2CachedW = 0;
 static int g_m2CachedH = 0;
 static DWORD g_m2CachedFmt = 0;
 static int g_m2CachedValid = 0;
+// Render-skip pacing (Quant runs every tick when <9ms; RenderScreen is independently decoupled 1:K)
+static int g_m2RenderPhase = 0;
+static double g_m2LastRenderMs = 0.0;
+static LARGE_INTEGER g_m2QpcFreq = {0};
 
 // 120 FPS Unlocker state (app.dll Sleep(3)->NOP + pro_sleepRender=0 + r_waitForRenderDone=0 + VSync OFF + RenderScreen Hook)
 static int g_m2Unlock120Installed = 0;
@@ -55,22 +59,54 @@ struct M2_D3DSURFACE_DESC_V10 {
 typedef void (__thiscall *PFN_M2RealRenderScreen)(void*);
 static PFN_M2RealRenderScreen g_m2RealRenderScreen = NULL;
 
+static inline double M2_QpcMs(void) {
+    LARGE_INTEGER t;
+    if (g_m2QpcFreq.QuadPart == 0) QueryPerformanceFrequency(&g_m2QpcFreq);
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / (double)g_m2QpcFreq.QuadPart;
+}
+
+// K = render every K-th tick, chosen so q + r/K + 1.5 <= 8.33ms
+static inline int M2_RenderSkipK(void) {
+    if (g_m2DecoupleMode <= 0) return 1;
+    if (g_m2LastRenderMs <= 0.1) return 4;
+    double budget = 8.33 - 1.5 - g_m2LastRealQuantMs;
+    if (budget < 0.8) budget = 0.8;
+    int k = (int)ceil(g_m2LastRenderMs / budget);
+    int kmax = (g_m2DecoupleMode == 2) ? 10 : 6;
+    if (k < 3 && g_m2DecoupleMode >= 1) k = 3;
+    return (k < 1) ? 1 : (k > kmax ? kmax : k);
+}
+
 static void __fastcall M2_HookedRenderScreen(void* thisPtr, void* edx) {
     (void)edx;
-    if (g_m2SubFrameSkipRender && g_m2CachedValid && g_m2CachedSurf != NULL && g_m2LastDevice != NULL && g_levelUp) {
-        g_m2DidSkipRenderRC = 1;
-        g_m2DecoupleSkippedRenders++;
-        Hook_Present(g_m2LastDevice, NULL, NULL, NULL, NULL);
-        g_m2DidSkipRenderRC = 0;
-        g_m2SubFrameSkipRender = 0;
-        return;
+    if (g_m2PostLoadWarmup > 0) g_m2PostLoadWarmup--;
+    int canReplay = g_levelUp && g_m2PostLoadWarmup <= 0 && g_m2CachedValid &&
+                    g_m2CachedSurf != NULL && g_m2LastDevice != NULL && g_m2DecoupleMode > 0;
+    if (canReplay) {
+        int k = M2_RenderSkipK();
+        if (g_m2SubFrameSkipRender || (++g_m2RenderPhase < k)) {
+            g_m2DidSkipRenderRC = 1;
+            g_m2DecoupleSkippedRenders++;
+            Hook_Present(g_m2LastDevice, NULL, NULL, NULL, NULL);
+            g_m2DidSkipRenderRC = 0;
+            g_m2SubFrameSkipRender = 0;
+            return;
+        }
     }
+    g_m2RenderPhase = 0;
+    g_m2SubFrameSkipRender = 0;
     g_m2DidSkipRenderRC = 0;
+    double t0 = M2_QpcMs();
     if (g_m2RealRenderScreen) {
         g_m2RealRenderScreen(thisPtr);
     } else {
         void** vtbl = *(void***)thisPtr;
         ((PFN_M2RealRenderScreen)vtbl[5])(thisPtr);
+    }
+    double r = M2_QpcMs() - t0;
+    if (r > 0.05 && r < 200.0) {
+        g_m2LastRenderMs = (g_m2LastRenderMs <= 0.1) ? r : (g_m2LastRenderMs * 0.8 + r * 0.2);
     }
 }
 
@@ -84,24 +120,26 @@ static inline void M2_TurboV10_OnBeforeReset(void) {
     g_m2CachedValid = 0;
     g_m2SubFrameSkipRender = 0;
     g_m2DidSkipRenderRC = 0;
+    g_m2RenderPhase = 0;
 }
 
 static inline void M2_TurboV10_OnBeforePresent(void* device) {
     if (!device) return;
-    static LARGE_INTEGER s_lastPresent = {0};
-    static LARGE_INTEGER s_freq = {0};
-    if (s_freq.QuadPart == 0) QueryPerformanceFrequency(&s_freq);
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if (s_lastPresent.QuadPart != 0 && s_freq.QuadPart != 0) {
-        double dt_ms = (double)(now.QuadPart - s_lastPresent.QuadPart) * 1000.0 / (double)s_freq.QuadPart;
-        if (dt_ms < 8.1 && g_m2LastRealQuantMs < 4.0) {
-            Sleep(1);
-            QueryPerformanceCounter(&now);
-        }
+    // Cap at 120 Hz (8.33ms): Sleep(1) overshoots under Wine, so sleep coarse only when >2.5ms remains, then QPC-spin the tail
+    static double s_lastPresentMs = 0.0;
+    double now = M2_QpcMs();
+    if (s_lastPresentMs > 0.0 && g_levelUp) {
+        double target = s_lastPresentMs + 8.33;
+        if (target - now > 2.5) { Sleep(1); now = M2_QpcMs(); }
+        while (now < target && target - now < 8.33) { YieldProcessor(); now = M2_QpcMs(); }
     }
-    s_lastPresent = now;
+    s_lastPresentMs = now;
     g_m2LastDevice = device;
+    // No cache surface / StretchRect copy during loading or warmup: eliminates GPU texture upload / RT stalls in GameStateLoadLevel
+    if (!g_levelUp || g_m2PostLoadWarmup > 0 || g_m2DecoupleMode <= 0) {
+        g_m2CachedValid = 0;
+        return;
+    }
     void** vtbl = *(void***)device;
     if (!vtbl || !vtbl[18] || !vtbl[28] || !vtbl[34]) return;
     typedef HRESULT (STDMETHODCALLTYPE *PFN_GetBackBuffer)(void*, UINT, UINT, DWORD, void**);
@@ -219,15 +257,16 @@ static inline void M2_TurboV8_UnlockApp120Fps(void) {
         g_m2RenderRCHookInstalled = 1;
     }
 
-    // 3. Clear pro_sleepRender (+0x31df0) and r_waitForRenderDone (+0x31e20) as 32-bit uint32_t after VirtualProtect RW
-    DWORD oldProt = 0;
-    if (VirtualProtect(base + 0x31df0, 0x100, PAGE_READWRITE, &oldProt)) {
-        *(volatile uint32_t*)(base + 0x31df0) = 0;
-        *(volatile uint32_t*)(base + 0x31e20) = 0;
-    } else {
-        *(volatile uint32_t*)(base + 0x31df0) = 0;
-        *(volatile uint32_t*)(base + 0x31e20) = 0;
+    // 3. Clear pro_sleepRender (+0x31df0) / r_waitForRenderDone (+0x31e20). VirtualProtect once only:
+    //    per-tick VirtualProtect is a wineserver round trip and showed up as load-time stalls.
+    static int s_cvarsRW = 0;
+    if (!s_cvarsRW) {
+        DWORD oldProt = 0;
+        VirtualProtect(base + 0x31df0, 0x100, PAGE_READWRITE, &oldProt);
+        s_cvarsRW = 1;
     }
+    *(volatile uint32_t*)(base + 0x31df0) = 0;
+    *(volatile uint32_t*)(base + 0x31e20) = 0;
     g_m2AppSleepPatched = 1;
 }
 
@@ -285,7 +324,7 @@ static int g_m2DidSkipQuant = 0;
 
 static inline int M2_DecoupleFilterQuant(int levelUp, int fdtMs, int detOn, int ms, int* outEffMs) {
     M2_TurboV7_InitEnv();
-    M2_TurboV8_UnlockApp120Fps();
+    if (!g_m2Unlock120Installed || !g_m2RenderRCHookInstalled) M2_TurboV8_UnlockApp120Fps();
     *outEffMs = ms;
     if (!levelUp || g_m2DecoupleMode <= 0 || fdtMs > 0 || detOn || !g_m2CachedValid || !g_m2CachedSurf || !g_m2LastDevice) {
         g_m2DecoupleSkipPhase = 0;
@@ -304,7 +343,9 @@ static inline int M2_DecoupleFilterQuant(int levelUp, int fdtMs, int detOn, int 
         g_m2DidSkipQuant = 0;
         return 0;
     }
-    const double threshMs = (g_m2DecoupleMode == 2) ? 0.05 : 6.0;
+    // RenderScreen is already decoupled 1:K inside M2_HookedRenderScreen!
+    // Only skip Quant if a single Quant exceeds 8.5ms (and cap maxSkip at 2 so game_x stays >= 3.8x and 180ms clamp never discards sim time)
+    const double threshMs = (g_m2DecoupleMode == 2) ? 5.5 : 8.5;
     if (g_m2LastRealQuantMs < threshMs) {
         g_m2DecoupleSkipPhase = 0;
         g_m2SubFrameSkipRender = 0;
@@ -318,13 +359,6 @@ static inline int M2_DecoupleFilterQuant(int levelUp, int fdtMs, int detOn, int 
         return 0;
     }
     int maxSkip = 2;
-    if (g_m2DecoupleMode >= 2) {
-        maxSkip = 11;
-    } else {
-        if (g_m2LastRealQuantMs >= 24.0) maxSkip = 4;      // 5x
-        else if (g_m2LastRealQuantMs >= 14.0) maxSkip = 3; // 4x
-        else maxSkip = 2;                                  // 3x
-    }
     if (g_m2DecoupleSkipPhase < maxSkip) {
         g_m2DecoupleSkipPhase++;
         int addMs = (ms > 0 && ms < 200) ? ms : 8;
@@ -348,8 +382,8 @@ static inline int M2_DecoupleFilterQuant(int levelUp, int fdtMs, int detOn, int 
 
 static inline void M2_DecoupleRecordQuantMs(double q_ms) {
     if (q_ms > 60.0) {
-        g_m2PostLoadWarmup = 120;
-        g_m2LastRealQuantMs = 0.0;
+        // Load-type spike: hold off render replay briefly, but keep the cost estimate
+        if (g_m2PostLoadWarmup < 30) g_m2PostLoadWarmup = 30;
     } else {
         g_m2LastRealQuantMs = (g_m2LastRealQuantMs <= 0.1) ? q_ms : (g_m2LastRealQuantMs * 0.7 + q_ms * 0.3);
     }
