@@ -2,6 +2,7 @@
 // Universal build: clang -arch x86_64 -arch arm64 -dynamiclib -fobjc-arc -framework AppKit -o build/libm2_gamemode.dylib src/m2_gamemode.m
 #import <AppKit/AppKit.h>
 #import <objc/message.h>
+#import <objc/runtime.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -34,25 +35,72 @@ static BOOL m2_is_game_window(NSWindow *w) {
            (f.size.width >= s.size.width * 0.85 && f.size.height >= s.size.height * 0.85);
 }
 
+static void (*orig_adjustFullScreenBehavior)(id, SEL, NSUInteger) = NULL;
+static void m2_swizzled_adjustFullScreenBehavior(NSWindow *self, SEL _cmd, NSUInteger behavior) {
+    behavior &= ~(NSWindowCollectionBehaviorFullScreenAuxiliary | NSWindowCollectionBehaviorFullScreenNone);
+    behavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+    if (orig_adjustFullScreenBehavior) {
+        orig_adjustFullScreenBehavior(self, _cmd, behavior);
+    } else {
+        self.collectionBehavior = behavior;
+    }
+    m2_tag_fullscreen_primary(self);
+    if (!(self.styleMask & NSWindowStyleMaskResizable)) {
+        self.styleMask |= NSWindowStyleMaskResizable;
+    }
+}
+
+static void (*orig_setWindowFeatures)(id, SEL, void *) = NULL;
+static void m2_swizzled_setWindowFeatures(NSWindow *self, SEL _cmd, void *features) {
+    if (orig_setWindowFeatures) {
+        orig_setWindowFeatures(self, _cmd, features);
+    }
+    m2_tag_fullscreen_primary(self);
+    if (!(self.styleMask & NSWindowStyleMaskResizable)) {
+        self.styleMask |= NSWindowStyleMaskResizable;
+    }
+}
+
+static void m2_swizzle_winewindow_if_needed(void) {
+    static BOOL swizzled = NO;
+    if (swizzled) return;
+    Class cls = NSClassFromString(@"WineWindow");
+    if (!cls) return;
+    swizzled = YES;
+    Method mAdjust = class_getInstanceMethod(cls, NSSelectorFromString(@"adjustFullScreenBehavior:"));
+    if (mAdjust) {
+        orig_adjustFullScreenBehavior = (void (*)(id, SEL, NSUInteger))method_getImplementation(mAdjust);
+        method_setImplementation(mAdjust, (IMP)m2_swizzled_adjustFullScreenBehavior);
+        NSLog(@"[M2-GameMode] Swizzled -[WineWindow adjustFullScreenBehavior:]");
+    }
+    Method mFeatures = class_getInstanceMethod(cls, NSSelectorFromString(@"setWindowFeatures:"));
+    if (mFeatures) {
+        orig_setWindowFeatures = (void (*)(id, SEL, void *))method_getImplementation(mFeatures);
+        method_setImplementation(mFeatures, (IMP)m2_swizzled_setWindowFeatures);
+        NSLog(@"[M2-GameMode] Swizzled -[WineWindow setWindowFeatures:]");
+    }
+}
+
 static void m2_try_fullscreen(NSWindow *w) {
     if (m2_done || m2_transitioning || !m2_is_game_window(w)) return;
+    m2_swizzle_winewindow_if_needed();
     m2_tag_fullscreen_primary(w);
     if (w.styleMask & NSWindowStyleMaskFullScreen) {
         m2_done = YES;
         NSLog(@"[M2-GameMode] Window '%@' already in native AppKit FullScreen Space; FullScreenPrimary confirmed", w.title);
         return;
     }
-    // Single fullscreen owner rule: do not mutate styleMask or fight winemac.drv if Wine already owns fullscreen
-    // or created a borderless non-resizable fullscreen window.
-    if (m2_is_wine_fullscreen(w) || !(w.styleMask & NSWindowStyleMaskResizable)) {
-        m2_done = YES;
-        NSLog(@"[M2-GameMode] Window '%@' owned by Wine fullscreen (styleMask=0x%lx) — tagged FullScreenPrimary without conflicting toggleFullScreen:",
-              w.title, (unsigned long)w.styleMask);
-        return;
+    // In AppKit, borderless windows (styleMask=0x0) cannot enter native FullScreen space
+    // unless NSWindowStyleMaskResizable is present on styleMask.
+    if (!(w.styleMask & NSWindowStyleMaskResizable)) {
+        w.styleMask |= NSWindowStyleMaskResizable;
     }
     m2_transitioning = YES;
-    NSLog(@"[M2-GameMode] Transitioning window '%@' into native AppKit FullScreen Space for gamepolicyd", w.title);
-    [w toggleFullScreen:nil];
+    NSLog(@"[M2-GameMode] Transitioning window '%@' (styleMask=0x%lx) into native AppKit FullScreen Space for gamepolicyd",
+          w.title, (unsigned long)w.styleMask);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [w toggleFullScreen:nil];
+    });
 }
 
 __attribute__((constructor)) static void m2_gamemode_init(void) {

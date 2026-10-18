@@ -1,0 +1,18 @@
+[package]
+name = "m2_rust_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "m2_rust_core"
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+strip = "symbols"
+
+[dependencies]

@@ -77,26 +77,24 @@ static inline double M2_QpcMs(void) {
 static inline int M2_RenderSkipK(void) {
     if (g_m2PostLoadWarmup > 0 || !g_levelUp || g_m2DecoupleMode <= 0) return 1;
     if (g_m2DecoupleMode == 1) {
-        if (s_emaRealRenderMs <= 6.5) return 1;
-        if (s_emaRealRenderMs <= 13.0) return 2;
-        if (s_emaRealRenderMs <= 20.0) return 3;
-        return g_m2RenderSkipK;
+        return (s_emaRealRenderMs <= 6.5) ? 1 :
+               (s_emaRealRenderMs <= 10.5) ? 2 :
+               (s_emaRealRenderMs <= 14.5) ? 4 :
+               (s_emaRealRenderMs <= 19.0) ? 6 : 8;
     }
-    if (s_emaRealRenderMs <= 5.0) return 1;
-    if (s_emaRealRenderMs <= 10.0) return 2;
-    if (s_emaRealRenderMs <= 16.0) return 3;
-    return g_m2RenderSkipK;
+    return (s_emaRealRenderMs <= 6.5) ? 2 :
+           (s_emaRealRenderMs <= 12.0) ? 4 :
+           (s_emaRealRenderMs <= 18.0) ? 6 : 8;
 }
 
 static void __fastcall M2_HookedRenderScreen(void* thisPtr, void* edx) {
     (void)edx;
-    if (g_m2PostLoadWarmup > 0) g_m2PostLoadWarmup--;
     int effK = M2_RenderSkipK();
     g_m2LastEffK = effK;
     int canReplay = g_levelUp && g_m2PostLoadWarmup <= 0 && g_m2CachedValid &&
                     g_m2CachedSurf != NULL && g_m2LastDevice != NULL && g_m2DecoupleMode > 0 && effK > 1;
     if (canReplay) {
-        if (g_m2SubFrameSkipRender || (++g_m2RenderPhase < effK)) {
+        if (++g_m2RenderPhase < effK) {
             g_m2DidSkipRenderRC = 1;
             g_m2DecoupleSkippedRenders++;
             g_m2ReplayFrames++;
@@ -111,18 +109,18 @@ static void __fastcall M2_HookedRenderScreen(void* thisPtr, void* edx) {
     g_m2DidSkipRenderRC = 0;
     g_m2RealFrames++;
     double t0 = M2_QpcMs();
+    g_inRenderScreen = 1;
     if (g_m2RealRenderScreen) {
         g_m2RealRenderScreen(thisPtr);
     } else {
         void** vtbl = *(void***)thisPtr;
         ((PFN_M2RealRenderScreen)vtbl[5])(thisPtr);
     }
+    g_inRenderScreen = 0;
     double r = M2_QpcMs() - t0;
-    if (r > 80.0) {
-        g_m2PostLoadWarmup = 180;
-        g_m2CachedValid = 0;
-    } else if (r > 0.05 && r < 200.0) {
-        s_emaRealRenderMs = (s_emaRealRenderMs <= 0.1) ? r : (s_emaRealRenderMs * 0.8 + r * 0.2);
+    if (r > 0.05 && r < 200.0) {
+        double cr = r > 50.0 ? 50.0 : r;
+        s_emaRealRenderMs = (s_emaRealRenderMs <= 0.1) ? cr : (s_emaRealRenderMs * 0.8 + cr * 0.2);
         g_m2LastRenderMs = s_emaRealRenderMs;
     }
 }
@@ -142,15 +140,15 @@ static inline void M2_TurboV10_OnBeforeReset(void) {
 
 static inline void M2_TurboV10_OnBeforePresent(void* device) {
     if (!device) return;
-    // Cap at 120 Hz (8.33ms): Sleep(1) overshoots under Wine, so sleep coarse only when >2.5ms remains, then QPC-spin the tail
     static double s_lastPresentMs = 0.0;
     double now = M2_QpcMs();
-    if (s_lastPresentMs > 0.0 && g_levelUp) {
-        double target = s_lastPresentMs + 8.33;
-        if (target - now > 2.5) { Sleep(1); now = M2_QpcMs(); }
-        while (now < target && target - now < 8.33) { YieldProcessor(); now = M2_QpcMs(); }
+    if (s_lastPresentMs > 0.0 && g_levelUp && g_m2DidSkipRenderRC) {
+        double targetFloorMs = (s_emaRealRenderMs > 14.0) ? 4.2 : 7.8;
+        double target = s_lastPresentMs + targetFloorMs;
+        if (target - now > 2.2) { Sleep(1); now = M2_QpcMs(); }
+        while (now < target && target - now < 8.0) { YieldProcessor(); now = M2_QpcMs(); }
     }
-    s_lastPresentMs = now;
+    s_lastPresentMs = M2_QpcMs();
     g_m2LastDevice = device;
     // No cache surface / StretchRect copy during loading or warmup: eliminates GPU texture upload / RT stalls in GameStateLoadLevel
     if (!g_levelUp || g_m2PostLoadWarmup > 0 || g_m2DecoupleMode <= 0) {
@@ -339,72 +337,54 @@ static inline void M2_OnAnisoUpgrade(void) {
 // g_m2PostLoadWarmup forward-declared in d3d9_proxy.cpp
 static int g_m2DidSkipQuant = 0;
 
-static inline int M2_DecoupleFilterQuant(int levelUp, int fdtMs, int detOn, int ms, int* outEffMs) {
+static inline int M2_DecoupleFilterQuant(int origMs, int* outEffMs) {
     M2_TurboV7_InitEnv();
     if (!g_m2Unlock120Installed || !g_m2RenderRCHookInstalled) M2_TurboV8_UnlockApp120Fps();
-    *outEffMs = ms;
-    if (!levelUp || g_m2DecoupleMode <= 0 || fdtMs > 0 || detOn || !g_m2CachedValid || !g_m2CachedSurf || !g_m2LastDevice) {
-        g_m2DecoupleSkipPhase = 0;
+    if (origMs < 1) origMs = 1;
+    if (origMs > 100) origMs = 100;
+    *outEffMs = origMs;
+    static double s_lastExecQuantWallMs = 0.0;
+    if (!g_levelUp || g_m2PostLoadWarmup > 0 || !g_m2CachedValid || g_m2DecoupleMode <= 0) {
+        s_lastExecQuantWallMs = 0.0;
         g_m2DecoupleAccumMs = 0;
-        g_m2SubFrameSkipRender = 0;
-        g_m2DidSkipRenderRC = 0;
-        g_m2DidSkipQuant = 0;
-        return 0;
-    }
-    if (g_m2PostLoadWarmup > 0) {
-        g_m2PostLoadWarmup--;
         g_m2DecoupleSkipPhase = 0;
-        g_m2DecoupleAccumMs = 0;
-        g_m2SubFrameSkipRender = 0;
-        g_m2DidSkipRenderRC = 0;
-        g_m2DidSkipQuant = 0;
         return 0;
     }
-    // RenderScreen is already decoupled 1:K inside M2_HookedRenderScreen!
-    // Only skip Quant if a single Quant exceeds 8.5ms (and cap maxSkip at 2 so game_x stays >= 3.8x and 180ms clamp never discards sim time)
-    const double threshMs = (g_m2DecoupleMode == 2) ? 5.5 : 8.5;
-    if (g_m2LastRealQuantMs < threshMs) {
-        g_m2DecoupleSkipPhase = 0;
-        g_m2SubFrameSkipRender = 0;
-        g_m2DidSkipRenderRC = 0;
-        g_m2DidSkipQuant = 0;
-        if (g_m2DecoupleAccumMs > 0) {
-            int tot = ms + g_m2DecoupleAccumMs;
-            g_m2DecoupleAccumMs = 0;
-            *outEffMs = (tot > 180) ? 180 : tot;
-        }
+
+    int effK = M2_RenderSkipK();
+    if (effK <= 1) {
+        s_lastExecQuantWallMs = 0.0;
+        *outEffMs = origMs;
         return 0;
     }
-    int maxSkip = 2;
-    if (g_m2DecoupleSkipPhase < maxSkip) {
-        g_m2DecoupleSkipPhase++;
-        int addMs = (ms > 0 && ms < 200) ? ms : 8;
-        g_m2DecoupleAccumMs += addMs;
+
+    int phase = g_m2RenderPhase;
+    int quantPhase = (effK >> 1) - 1;
+    if (quantPhase < 0) quantPhase = 0;
+    bool isQuantTick = (phase == quantPhase);
+
+    if (!isQuantTick) {
         g_m2DecoupleSkipped++;
-        g_m2SubFrameSkipRender = 1;
-        g_m2DidSkipQuant = 1;
-        g_r3Cam = 1;
         return 1;
     }
-    g_m2DecoupleSkipPhase = 0;
-    g_m2SubFrameSkipRender = 0;
-    g_m2DidSkipRenderRC = 0;
-    g_m2DidSkipQuant = 0;
-    int tot = ms + g_m2DecoupleAccumMs;
-    g_m2DecoupleAccumMs = 0;
-    if (tot > 180) tot = 180;
-    *outEffMs = tot;
+
+    double nowWall = M2_QpcMs();
+    int passMs = origMs;
+    if (s_lastExecQuantWallMs > 0.0 && (nowWall - s_lastExecQuantWallMs) < 250.0) {
+        passMs = (int)(nowWall - s_lastExecQuantWallMs + 0.5);
+    }
+    s_lastExecQuantWallMs = nowWall;
+    double s_decoupleLastQuantMs = g_m2LastRealQuantMs;
+    int maxPass = (s_decoupleLastQuantMs > 25.0) ? 42 : 75;
+    if (passMs > maxPass) passMs = maxPass;
+    if (passMs < 1) passMs = 1;
+    *outEffMs = passMs;
     return 0;
 }
 
 static inline void M2_DecoupleRecordQuantMs(double q_ms) {
-    if (q_ms > 60.0) {
-        // Load-type spike: hold off render replay for 180 frames and invalidate cached surface
-        g_m2PostLoadWarmup = 180;
-        g_m2CachedValid = 0;
-    } else {
-        g_m2LastRealQuantMs = (g_m2LastRealQuantMs <= 0.1) ? q_ms : (g_m2LastRealQuantMs * 0.7 + q_ms * 0.3);
-    }
+    double clamped_q = q_ms > 40.0 ? 40.0 : q_ms;
+    g_m2LastRealQuantMs = (g_m2LastRealQuantMs <= 0.1) ? clamped_q : (g_m2LastRealQuantMs * 0.7 + clamped_q * 0.3);
 }
 
 typedef void    (STDMETHODCALLTYPE *PFN_M2SetGammaRamp)(void* pDevice, UINT iSwapChain, DWORD Flags, const void* pRamp);
@@ -522,8 +502,8 @@ static inline void M2_TurboHud_PollHotkeys(void* pDevice) {
     }
     M2_TurboHud_DrawToast(pDevice);
     if (!M2_TurboHud_IsEnabled()) return;
-    static uint32_t s_hkTick = 0;
-    if ((s_hkTick++ & 7) != 0) return;
+    static uint32_t s_keyTick = 0;
+    if ((s_keyTick++ & 15u) != 0) return;
 
     const int vks[5] = { VK_F8, VK_F9, VK_F10, VK_F11, VK_F12 };
     for (int i = 0; i < 5; ++i) {

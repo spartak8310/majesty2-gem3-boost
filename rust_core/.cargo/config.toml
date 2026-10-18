@@ -1,0 +1,8 @@
+[build]
+target = "i686-pc-windows-gnu"
+
+[target.i686-pc-windows-gnu]
+rustflags = [
+    "-C", "target-feature=+sse2,+sse3,+ssse3,+sse4.1,+sse4.2",
+    "-C", "panic=abort",
+]

@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include "m2_pather_sse2.h"
+#include "m2_rust_bridge.h"
 
 typedef void* (WINAPI *PFN_Direct3DCreate9)(UINT SDKVersion);
 typedef int   (WINAPI *PFN_D3DPERF_BeginEvent)(DWORD col, LPCWSTR wszName);
@@ -489,17 +490,129 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateIndexBuffer(void* dev, D len, D us, 
     return hr;
 }
 
+static DWORD g_rsVal[256];
+static uint8_t g_rsValid[256];
+static DWORD g_tssVal[8][36];
+static uint8_t g_tssValid[8][36];
+static DWORD g_ssVal[16][16];
+static uint8_t g_ssValid[16][16];
+static void* g_texVal[16];
+static uint8_t g_texValid[16];
+static void* g_vdeclVal = NULL;
+static uint8_t g_vdeclValid = 0;
+static DWORD g_fvfVal = 0;
+static uint8_t g_fvfValid = 0;
+static void* g_vsVal = NULL;
+static uint8_t g_vsValid = 0;
+static void* g_psVal = NULL;
+static uint8_t g_psValid = 0;
+static volatile LONG g_sbRecording = 0;
+static volatile uint32_t g_stateCacheHits = 0;
+
+static inline void M2_InvalidateStateCache(void) {
+    memset(g_rsValid, 0, sizeof(g_rsValid));
+    memset(g_tssValid, 0, sizeof(g_tssValid));
+    memset(g_ssValid, 0, sizeof(g_ssValid));
+    memset(g_texValid, 0, sizeof(g_texValid));
+    g_vdeclValid = 0;
+    g_fvfValid = 0;
+    g_vsValid = 0;
+    g_psValid = 0;
+}
+
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SBApply)(void* pSB);
+static PFN_SBApply g_origSBApply = NULL;
+static HRESULT STDMETHODCALLTYPE Hook_StateBlockApply(void* pSB) {
+    M2_InvalidateStateCache();
+    return g_origSBApply(pSB);
+}
+static void HookStateBlockVtbl(void* sb) {
+    if (!sb) return;
+    void** vtbl = *(void***)sb;
+    if (!vtbl || vtbl[5] == (void*)Hook_StateBlockApply) return;
+    g_origSBApply = (PFN_SBApply)vtbl[5];
+    PatchPtr(&vtbl[5], (void*)Hook_StateBlockApply);
+}
+
+typedef TimedHook<59, B_STATE, D, P> HCreateSB;
+typedef TimedHook<60, B_STATE> HBeginSB;
+typedef TimedHook<61, B_STATE, P> HEndSB;
+
+static HRESULT STDMETHODCALLTYPE Hook_CreateStateBlock(void* dev, D type, P ppSB) {
+    M2_InvalidateStateCache();
+    HRESULT hr = HCreateSB::Hook(dev, type, ppSB);
+    if (SUCCEEDED(hr) && ppSB) HookStateBlockVtbl(*(void**)ppSB);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE Hook_BeginStateBlock(void* dev) {
+    g_sbRecording = 1;
+    M2_InvalidateStateCache();
+    return HBeginSB::Hook(dev);
+}
+static HRESULT STDMETHODCALLTYPE Hook_EndStateBlock(void* dev, P ppSB) {
+    g_sbRecording = 0;
+    M2_InvalidateStateCache();
+    HRESULT hr = HEndSB::Hook(dev, ppSB);
+    if (SUCCEEDED(hr) && ppSB) HookStateBlockVtbl(*(void**)ppSB);
+    return hr;
+}
+
+typedef TimedHook<57, B_STATE, D, D> HSetRS;
+static HRESULT STDMETHODCALLTYPE Hook_SetRenderState(void* dev, D state, D val) {
+    if (!g_sbRecording && state < 256u && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+        if (g_rsValid[state] && g_rsVal[state] == val) {
+            g_stateCacheHits++;
+            return S_OK;
+        }
+        g_rsValid[state] = 1;
+        g_rsVal[state] = val;
+    } else if (state < 256u) {
+        g_rsValid[state] = 0;
+    }
+    return HSetRS::Hook(dev, state, val);
+}
+
+typedef TimedHook<67, B_STATE, D, D, D> HSetTSS;
+static HRESULT STDMETHODCALLTYPE Hook_SetTextureStageState(void* dev, D stage, D type, D val) {
+    if (!g_sbRecording && stage < 8u && type < 36u && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+        if (g_tssValid[stage][type] && g_tssVal[stage][type] == val) {
+            g_stateCacheHits++;
+            return S_OK;
+        }
+        g_tssValid[stage][type] = 1;
+        g_tssVal[stage][type] = val;
+    } else if (stage < 8u && type < 36u) {
+        g_tssValid[stage][type] = 0;
+    }
+    return HSetTSS::Hook(dev, stage, type, val);
+}
+
 typedef TimedHook<69, B_STATE, D, D, D> HSetSampler;
 static inline int M2_GetHdrMode(void);
 static inline void M2_OnAnisoUpgrade(void);
+
+static inline HRESULT M2_ApplySamplerStateFiltered(void* dev, D samp, D type, D val) {
+    if (!g_sbRecording && samp < 16u && type < 16u && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+        if (g_ssValid[samp][type] && g_ssVal[samp][type] == val) {
+            g_stateCacheHits++;
+            return S_OK;
+        }
+        g_ssValid[samp][type] = 1;
+        g_ssVal[samp][type] = val;
+    } else if (samp < 16u && type < 16u) {
+        g_ssValid[samp][type] = 0;
+    }
+    return HSetSampler::Hook(dev, samp, type, val);
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_SetSamplerState(void* dev, D samp, D type, D val) {
     int hm = M2_GetHdrMode();
     if (hm > 0 && samp < 8) {
         if (type == 6 && (val == 2 || val == 3)) { // D3DSAMP_MINFILTER: LINEAR/ANISO -> 16x ANISOTROPIC + sharp MipBias
             val = 3;
-            HSetSampler::Hook(dev, samp, 10, 16); // D3DSAMP_MAXANISOTROPY = 16
+            M2_ApplySamplerStateFiltered(dev, samp, 10, 16); // D3DSAMP_MAXANISOTROPY = 16
             D bias = (hm == 2) ? 0xBF733333u : 0xBF266666u; // -0.95f or -0.65f
-            HSetSampler::Hook(dev, samp, 8, bias); // D3DSAMP_MIPMAPLODBIAS
+            M2_ApplySamplerStateFiltered(dev, samp, 8, bias); // D3DSAMP_MIPMAPLODBIAS
             M2_OnAnisoUpgrade();
         } else if (type == 7 && val == 1) { // D3DSAMP_MIPFILTER: POINT -> LINEAR
             val = 2;
@@ -507,7 +620,84 @@ static HRESULT STDMETHODCALLTYPE Hook_SetSamplerState(void* dev, D samp, D type,
             val = (hm == 2) ? 0xBF733333u : 0xBF266666u;
         }
     }
-    return HSetSampler::Hook(dev, samp, type, val);
+    return M2_ApplySamplerStateFiltered(dev, samp, type, val);
+}
+
+typedef TimedHook<65, B_STATE, D, P> HSetTexture;
+static HRESULT STDMETHODCALLTYPE Hook_SetTexture(void* dev, D stage, P pTexture) {
+    if (!g_sbRecording && stage < 16u && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+        if (g_texValid[stage] && g_texVal[stage] == pTexture) {
+            g_stateCacheHits++;
+            return S_OK;
+        }
+        g_texValid[stage] = 1;
+        g_texVal[stage] = pTexture;
+    } else if (stage < 16u) {
+        g_texValid[stage] = 0;
+    }
+    return HSetTexture::Hook(dev, stage, pTexture);
+}
+
+typedef TimedHook<87, B_STATE, P> HSetVDecl;
+static HRESULT STDMETHODCALLTYPE Hook_SetVertexDeclaration(void* dev, P pDecl) {
+    if (!g_sbRecording && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+        if (g_vdeclValid && g_vdeclVal == pDecl) {
+            g_stateCacheHits++;
+            return S_OK;
+        }
+        g_vdeclValid = 1;
+        g_vdeclVal = pDecl;
+        g_fvfValid = 0;
+    } else {
+        g_vdeclValid = 0;
+    }
+    return HSetVDecl::Hook(dev, pDecl);
+}
+
+typedef TimedHook<89, B_STATE, D> HSetFVF;
+static HRESULT STDMETHODCALLTYPE Hook_SetFVF(void* dev, D fvf) {
+    if (!g_sbRecording && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+        if (g_fvfValid && g_fvfVal == fvf) {
+            g_stateCacheHits++;
+            return S_OK;
+        }
+        g_fvfValid = 1;
+        g_fvfVal = fvf;
+        g_vdeclValid = 0;
+    } else {
+        g_fvfValid = 0;
+    }
+    return HSetFVF::Hook(dev, fvf);
+}
+
+typedef TimedHook<92, B_STATE, P> HSetVS;
+static HRESULT STDMETHODCALLTYPE Hook_SetVertexShader(void* dev, P pShader) {
+    if (!g_sbRecording && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+        if (g_vsValid && g_vsVal == pShader) {
+            g_stateCacheHits++;
+            return S_OK;
+        }
+        g_vsValid = 1;
+        g_vsVal = pShader;
+    } else {
+        g_vsValid = 0;
+    }
+    return HSetVS::Hook(dev, pShader);
+}
+
+typedef TimedHook<107, B_STATE, P> HSetPS;
+static HRESULT STDMETHODCALLTYPE Hook_SetPixelShader(void* dev, P pShader) {
+    if (!g_sbRecording && (!g_renderTid || GetCurrentThreadId() == g_renderTid)) {
+        if (g_psValid && g_psVal == pShader) {
+            g_stateCacheHits++;
+            return S_OK;
+        }
+        g_psValid = 1;
+        g_psVal = pShader;
+    } else {
+        g_psValid = 0;
+    }
+    return HSetPS::Hook(dev, pShader);
 }
 
 static void InstallSetTransformCapture(void** vtbl);  // Wave 1: frustum capture (defined below)
@@ -518,18 +708,21 @@ static void InstallDevicePhaseHooks(void** vtbl) {
     // same B_STATE accounting and additionally captures D3DTS_VIEW / D3DTS_PROJECTION for the frustum.
     InstallSetTransformCapture(vtbl);
     HookSlot<TimedHook<47, B_STATE, P> >(vtbl, 47);              // SetViewport
-    HookSlot<TimedHook<57, B_STATE, D, D> >(vtbl, 57);           // SetRenderState
-    HookSlot<TimedHook<65, B_STATE, D, P> >(vtbl, 65);           // SetTexture
-    HookSlot<TimedHook<67, B_STATE, D, D, D> >(vtbl, 67);        // SetTextureStageState
+    if (vtbl[57] != (void*)Hook_SetRenderState) { HSetRS::orig = (HSetRS::Fn)vtbl[57]; PatchPtr(&vtbl[57], (void*)Hook_SetRenderState); }
+    if (vtbl[59] != (void*)Hook_CreateStateBlock) { HCreateSB::orig = (HCreateSB::Fn)vtbl[59]; PatchPtr(&vtbl[59], (void*)Hook_CreateStateBlock); }
+    if (vtbl[60] != (void*)Hook_BeginStateBlock) { HBeginSB::orig = (HBeginSB::Fn)vtbl[60]; PatchPtr(&vtbl[60], (void*)Hook_BeginStateBlock); }
+    if (vtbl[61] != (void*)Hook_EndStateBlock) { HEndSB::orig = (HEndSB::Fn)vtbl[61]; PatchPtr(&vtbl[61], (void*)Hook_EndStateBlock); }
+    if (vtbl[65] != (void*)Hook_SetTexture) { HSetTexture::orig = (HSetTexture::Fn)vtbl[65]; PatchPtr(&vtbl[65], (void*)Hook_SetTexture); }
+    if (vtbl[67] != (void*)Hook_SetTextureStageState) { HSetTSS::orig = (HSetTSS::Fn)vtbl[67]; PatchPtr(&vtbl[67], (void*)Hook_SetTextureStageState); }
     if (vtbl[69] != (void*)Hook_SetSamplerState) { HSetSampler::orig = (HSetSampler::Fn)vtbl[69]; PatchPtr(&vtbl[69], (void*)Hook_SetSamplerState); }
     HookSlot<TimedHook<75, B_STATE, P> >(vtbl, 75);              // SetScissorRect
-    HookSlot<TimedHook<87, B_STATE, P> >(vtbl, 87);              // SetVertexDeclaration
-    HookSlot<TimedHook<89, B_STATE, D> >(vtbl, 89);              // SetFVF
-    HookSlot<TimedHook<92, B_STATE, P> >(vtbl, 92);              // SetVertexShader
+    if (vtbl[87] != (void*)Hook_SetVertexDeclaration) { HSetVDecl::orig = (HSetVDecl::Fn)vtbl[87]; PatchPtr(&vtbl[87], (void*)Hook_SetVertexDeclaration); }
+    if (vtbl[89] != (void*)Hook_SetFVF) { HSetFVF::orig = (HSetFVF::Fn)vtbl[89]; PatchPtr(&vtbl[89], (void*)Hook_SetFVF); }
+    if (vtbl[92] != (void*)Hook_SetVertexShader) { HSetVS::orig = (HSetVS::Fn)vtbl[92]; PatchPtr(&vtbl[92], (void*)Hook_SetVertexShader); }
     HookSlot<TimedHook<94, B_STATE, D, P, D> >(vtbl, 94);        // SetVertexShaderConstantF
     HookSlot<TimedHook<100, B_STATE, D, P, D, D> >(vtbl, 100);   // SetStreamSource
     HookSlot<TimedHook<104, B_STATE, P> >(vtbl, 104);            // SetIndices
-    HookSlot<TimedHook<107, B_STATE, P> >(vtbl, 107);            // SetPixelShader
+    if (vtbl[107] != (void*)Hook_SetPixelShader) { HSetPS::orig = (HSetPS::Fn)vtbl[107]; PatchPtr(&vtbl[107], (void*)Hook_SetPixelShader); }
     HookSlot<TimedHook<109, B_STATE, D, P, D> >(vtbl, 109);      // SetPixelShaderConstantF
     // misc: render-target switches, clears, copies and readbacks (potential GPU sync points)
     HookSlot<TimedHook<30, B_MISC, P, P, P, P> >(vtbl, 30);      // UpdateSurface
@@ -1259,7 +1452,7 @@ typedef float (__thiscall *PFN_QcFloat)(void* self);
 static PFN_QcGet g_qcGet = NULL;
 static PFN_QcFloat g_qcSpeed = NULL, g_qcSpeedScale = NULL;
 static bool g_levelUp = false;
-static int g_m2PostLoadWarmup = 180;
+static int g_m2PostLoadWarmup = 60;
 static int g_m2CachedValid = 0;
 static bool g_autostart = false;
 static LARGE_INTEGER g_levelUpTick = {0};  // QPC when SecondUpdate was seen
@@ -1556,7 +1749,7 @@ static void AutoStartTick(const LARGE_INTEGER& now) {
         if (DebugLogHas("GameStateLevel::SecondUpdate started in")) {
             LogLine("autostart: SecondUpdate seen -> watching for Advisor / M2MessageBox dialogs");
             g_levelUp = true;
-            g_m2PostLoadWarmup = 180;
+            g_m2PostLoadWarmup = 60;
             g_m2CachedValid = 0;
             g_levelUpTick = now;
             LogModules("level");
@@ -1624,7 +1817,7 @@ static PFN_AppQuant g_realAppQuant = NULL;
 static volatile int64_t g_quantTicks = 0;
 static volatile uint32_t g_quantCalls = 0;
 static volatile uint64_t g_quantArgMs = 0, g_quantGameMs = 0;
-static volatile LONG g_inQuant = 0, g_inPresent = 0;  // phase flags read by the profiler thread
+static volatile LONG g_inQuant = 0, g_inPresent = 0, g_inRenderScreen = 0;  // phase flags read by the profiler thread
 typedef int (__thiscall *PFN_QcInt)(void* self);
 static PFN_QcInt g_qcDeltaQuants = NULL;
 
@@ -4881,7 +5074,7 @@ static void M2_PfTelemetry(double tSec) {
 
 // g_m2PostLoadWarmup and g_m2CachedValid declared above alongside g_levelUp
 static double g_m2LastRealQuantMs = 0.0;
-static inline int M2_DecoupleFilterQuant(int levelUp, int fdtMs, int detOn, int ms, int* outEffMs);
+static inline int M2_DecoupleFilterQuant(int origMs, int* outEffMs);
 static inline void M2_DecoupleRecordQuantMs(double qMs);
 
 static void __fastcall Hook_AppQuant(void* self, void* edx, int ms) {
@@ -4899,8 +5092,11 @@ static void __fastcall Hook_AppQuant(void* self, void* edx, int ms) {
         if (*(float*)0x00ABED4C > 0.55f) *(float*)0x00ABED4C = 0.50f;
     }
     int effMs = ms;
-    if (M2_DecoupleFilterQuant(g_levelUp, g_fdtMs, g_detOn, ms, &effMs)) {
+    if (M2_DecoupleFilterQuant(ms, &effMs)) {
         return; // Sub-Tick Render Decoupler: bypass heavy Quant on this visual frame
+    }
+    if (self) {
+        *(float*)((char*)self + 0x8c) = (float)effMs * 0.001f;
     }
     g_inQuant = 1;
     int64_t t0 = Qpc();
@@ -4929,13 +5125,8 @@ static void __fastcall Hook_AppQuant(void* self, void* edx, int ms) {
     g_quantTicks += dtQuantTicks;
     if (g_qpcFreq.QuadPart != 0) {
         double q_ms = (double)dtQuantTicks * 1000.0 / (double)g_qpcFreq.QuadPart;
-        if (q_ms > 60.0) {
-            g_m2PostLoadWarmup = 180;
-            g_m2CachedValid = 0;
-            g_m2LastRealQuantMs = 0.0;
-        } else {
-            g_m2LastRealQuantMs = (g_m2LastRealQuantMs <= 0.1) ? q_ms : (g_m2LastRealQuantMs * 0.7 + q_ms * 0.3);
-        }
+        double clamped_q = q_ms > 40.0 ? 40.0 : q_ms;
+        g_m2LastRealQuantMs = (g_m2LastRealQuantMs <= 0.1) ? clamped_q : (g_m2LastRealQuantMs * 0.7 + clamped_q * 0.3);
     }
     M2_R3QuantTick(M2_R3NowUs());   // Wave 3: moment the new simulation state became true
     g_inQuant = 0;
@@ -5106,6 +5297,228 @@ static void ProfWriteTop(HANDLE f, const char* title, int n, int top, DWORD deno
         len = snprintf(line, sizeof(line), "%3d %6lu %6.2f%%  %s\n", i + 1, (unsigned long)g_kc[i].count,
                        100.0 * g_kc[i].count / (denom ? denom : 1), addr);
         WriteFile(f, line, len, &w, NULL);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Live EIP Sampling Profiler for RenderScreen vs Quant (0.25ms sampling interval)
+// -----------------------------------------------------------------------------
+#define EIP_PROF_SAMPLES_MAX 65536
+static DWORD g_eipProfSamples[2][2][EIP_PROF_SAMPLES_MAX]; // [buf 0 or 1][phase: 0=RenderScreen, 1=Quant][sample_idx]
+static volatile uint32_t g_eipProfSampleCount[2][2] = {{0, 0}, {0, 0}};
+static volatile LONG g_eipProfActiveBuf = 0;
+static HANDLE g_eipSamplerThread = NULL;
+static volatile LONG g_eipSamplerStop = 0;
+
+struct EipEntry {
+    DWORD eip;
+    uint32_t count;
+};
+static EipEntry s_eipHits[EIP_PROF_SAMPLES_MAX];
+
+// Cumulative hit counters across the whole run
+static EipEntry s_cumHits[2][EIP_PROF_SAMPLES_MAX];
+static int s_cumHitsCount[2] = {0, 0};
+static uint32_t s_cumTotalSamples[2] = {0, 0};
+
+static int CmpEipHitsDesc(const void* a, const void* b) {
+    const EipEntry* x = (const EipEntry*)a;
+    const EipEntry* y = (const EipEntry*)b;
+    if (x->count != y->count) return (x->count < y->count) ? 1 : -1;
+    return (x->eip < y->eip) ? -1 : (x->eip > y->eip) ? 1 : 0;
+}
+
+static DWORD WINAPI EipSamplerThreadProc(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    ProfLoadModules();
+
+    int64_t targetIntervalTicks = 0;
+    if (g_qpcFreq.QuadPart > 0) {
+        targetIntervalTicks = (g_qpcFreq.QuadPart * 250) / 1000000LL; // 250 us = 0.25 ms
+    }
+    if (targetIntervalTicks <= 0) targetIntervalTicks = 2500;
+
+    while (!g_eipSamplerStop) {
+        // Fast path: sleep if main thread is not inside RenderScreen or Quant
+        if (!g_inRenderScreen && !g_inQuant) {
+            Sleep(1);
+            continue;
+        }
+
+        int64_t t0 = Qpc();
+
+        // 0 = RenderScreen, 1 = Quant
+        int phase = g_inRenderScreen ? 0 : (g_inQuant ? 1 : -1);
+        HANDLE hThread = g_mainThread;
+        if (phase >= 0 && hThread) {
+            if (SuspendThread(hThread) != (DWORD)-1) {
+                int p2 = g_inRenderScreen ? 0 : (g_inQuant ? 1 : -1);
+                if (p2 >= 0) {
+                    CONTEXT ctx;
+                    memset(&ctx, 0, sizeof(ctx));
+                    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                    if (GetThreadContext(hThread, &ctx)) {
+                        int active = g_eipProfActiveBuf;
+                        uint32_t cur = g_eipProfSampleCount[active][p2];
+                        if (cur < EIP_PROF_SAMPLES_MAX) {
+                            g_eipProfSamples[active][p2][cur] = ctx.Eip;
+                            g_eipProfSampleCount[active][p2] = cur + 1;
+                        }
+                    }
+                }
+                ResumeThread(hThread);
+            }
+        }
+
+        // Wait remainder of 0.25ms window
+        int64_t tEnd = t0 + targetIntervalTicks;
+        while (Qpc() < tEnd) {
+            SwitchToThread();
+        }
+    }
+    return 0;
+}
+
+static inline bool IsEipProfEnabled(void) {
+    static int s_enabled = -1;
+    if (s_enabled == -1) {
+        const char* ev = getenv("M2_EIP_PROF");
+        char winEv[16] = {0};
+        if ((ev && strcmp(ev, "1") == 0) ||
+            (GetEnvironmentVariableA("M2_EIP_PROF", winEv, sizeof(winEv)) > 0 && strcmp(winEv, "1") == 0)) {
+            s_enabled = 1;
+        } else {
+            s_enabled = 0;
+        }
+    }
+    return s_enabled == 1;
+}
+
+static void StartEipSamplerIfNeeded(void) {
+    if (!IsEipProfEnabled()) return;
+    static volatile LONG started = 0;
+    if (InterlockedCompareExchange(&started, 1, 0) == 0) {
+        ProfLoadModules();
+        g_eipSamplerThread = CreateThread(NULL, 0, EipSamplerThreadProc, NULL, 0, NULL);
+        if (g_eipSamplerThread) {
+            LogLine("eip_prof: 0.25ms background thread EIP sampler running (RenderScreen vs Quant)");
+        } else {
+            LogLine("eip_prof: FAILED to launch EIP sampler thread");
+        }
+    }
+}
+
+static void M2_EipProfTelemetry(double total_el) {
+    if (!IsEipProfEnabled()) return;
+    if (g_logFile == INVALID_HANDLE_VALUE) return;
+
+    int readBuf = g_eipProfActiveBuf;
+    g_eipProfActiveBuf = 1 - readBuf;
+    g_eipProfSampleCount[1 - readBuf][0] = 0;
+    g_eipProfSampleCount[1 - readBuf][1] = 0;
+
+    SwitchToThread();
+    ProfLoadModules();
+
+    for (int p = 0; p < 2; ++p) {
+        const char* phaseName = (p == 0) ? "render" : "quant";
+        uint32_t n = g_eipProfSampleCount[readBuf][p];
+        if (n == 0) continue;
+
+        DWORD* arr = g_eipProfSamples[readBuf][p];
+        qsort(arr, n, sizeof(DWORD), CmpDword);
+
+        int u = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (u && s_eipHits[u - 1].eip == arr[i]) {
+                s_eipHits[u - 1].count++;
+            } else {
+                s_eipHits[u].eip = arr[i];
+                s_eipHits[u].count = 1;
+                ++u;
+            }
+        }
+        qsort(s_eipHits, u, sizeof(EipEntry), CmpEipHitsDesc);
+
+        // Update cumulative table
+        s_cumTotalSamples[p] += n;
+        for (int i = 0; i < u; ++i) {
+            DWORD eip = s_eipHits[i].eip;
+            uint32_t cnt = s_eipHits[i].count;
+            bool found = false;
+            for (int k = 0; k < s_cumHitsCount[p]; ++k) {
+                if (s_cumHits[p][k].eip == eip) {
+                    s_cumHits[p][k].count += cnt;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found && s_cumHitsCount[p] < EIP_PROF_SAMPLES_MAX) {
+                s_cumHits[p][s_cumHitsCount[p]].eip = eip;
+                s_cumHits[p][s_cumHitsCount[p]].count = cnt;
+                s_cumHitsCount[p]++;
+            }
+        }
+
+        char line[512];
+        DWORD w = 0;
+        int len = snprintf(line, sizeof(line), "# eip_top_%s t=%.2f samples=%u unique=%d\n",
+                           phaseName, total_el, n, u);
+        WriteFile(g_logFile, line, (DWORD)len, &w, NULL);
+
+        int topCount = u < 15 ? u : 15;
+        for (int i = 0; i < topCount; ++i) {
+            DWORD eip = s_eipHits[i].eip;
+            uint32_t cnt = s_eipHits[i].count;
+            double pct = 100.0 * (double)cnt / (double)n;
+            const ProfModule* m = ProfFindModule(eip);
+            DWORD rva = m ? (eip - m->base) : eip;
+            const char* modName = m ? m->name : "<unknown>";
+            char exp[128] = {0};
+            ProfNearestExport(m, eip, exp, sizeof(exp));
+
+            len = snprintf(line, sizeof(line), "#   eip_%s [%2d] %-18s +0x%06lX : %5u hits (%5.1f%%)  %s\n",
+                           phaseName, i + 1, modName, (unsigned long)rva, cnt, pct, exp);
+            WriteFile(g_logFile, line, (DWORD)len, &w, NULL);
+        }
+        FlushFileBuffers(g_logFile);
+    }
+}
+
+static void M2_EipProfLogCumulative(void) {
+    if (!IsEipProfEnabled()) return;
+    if (g_logFile == INVALID_HANDLE_VALUE) return;
+    ProfLoadModules();
+    for (int p = 0; p < 2; ++p) {
+        const char* phaseName = (p == 0) ? "render" : "quant";
+        uint32_t total = s_cumTotalSamples[p];
+        int u = s_cumHitsCount[p];
+        if (total == 0 || u == 0) continue;
+
+        qsort(s_cumHits[p], u, sizeof(EipEntry), CmpEipHitsDesc);
+
+        char line[512];
+        DWORD w = 0;
+        int len = snprintf(line, sizeof(line), "# eip_cum_%s total_samples=%u unique_eips=%d\n",
+                           phaseName, total, u);
+        WriteFile(g_logFile, line, (DWORD)len, &w, NULL);
+
+        int topCount = u < 15 ? u : 15;
+        for (int i = 0; i < topCount; ++i) {
+            DWORD eip = s_cumHits[p][i].eip;
+            uint32_t cnt = s_cumHits[p][i].count;
+            double pct = 100.0 * (double)cnt / (double)total;
+            const ProfModule* m = ProfFindModule(eip);
+            DWORD rva = m ? (eip - m->base) : eip;
+            const char* modName = m ? m->name : "<unknown>";
+            char exp[128] = {0};
+            ProfNearestExport(m, eip, exp, sizeof(exp));
+
+            len = snprintf(line, sizeof(line), "#   cum_%s [%2d] %-18s +0x%06lX : %6u hits (%5.1f%%)  %s\n",
+                           phaseName, i + 1, modName, (unsigned long)rva, cnt, pct, exp);
+            WriteFile(g_logFile, line, (DWORD)len, &w, NULL);
+        }
+        FlushFileBuffers(g_logFile);
     }
 }
 
@@ -6201,6 +6614,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
     HWND hDestWindowOverride, const RGNDATA* pDirtyRegion)
 {
     if (!g_renderTid) g_renderTid = GetCurrentThreadId();
+    M2_TurboV10_OnBeforePresent(pDevice);
     M2_R3Init();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -6233,7 +6647,6 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
     int dcOwnsSwap = 0;
     if (g_dcEnabled) dcOwnsSwap = (M2_DCOnPresent(pDevice, M2_R3TickToUs(now.QuadPart)) == 0);
     if (gate && !dcOwnsSwap) {
-        M2_TurboV10_OnBeforePresent(pDevice);
         M2_TurboHud_PollHotkeys(pDevice);
     }
     int64_t tp0 = Qpc();
@@ -6254,30 +6667,36 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
         M2ArenaLateSweep();                        // Splice 1: free-family hooks for DLLs loaded after device creation
     }
     ProfilerTick(now);
+    StartEipSamplerIfNeeded();
     if (!g_m2HudWnd && hDestWindowOverride) g_m2HudWnd = hDestWindowOverride;
     M2_TurboHud_OnPresent(pDevice);
 
+    if (g_m2PostLoadWarmup > 0) g_m2PostLoadWarmup--;
     static uint32_t s_prevFrameDraws = 0;
     static uint32_t s_lowDrawFrames = 0;
+    static uint32_t s_lowDraw80Frames = 0;
     static uint32_t s_sceneSecs = 0;
     if (!g_m2DidSkipRenderRC) {
         uint32_t curDraws = g_draws;
         uint32_t frameDraws = (curDraws >= s_prevFrameDraws) ? (curDraws - s_prevFrameDraws) : curDraws;
         s_prevFrameDraws = curDraws;
         if (frameDraws < 80u) {
-            g_m2PostLoadWarmup = 180;
-            g_m2CachedValid = 0;
+            if (++s_lowDraw80Frames >= 5u) {
+                g_m2PostLoadWarmup = 60;
+                g_m2CachedValid = 0;
+            }
             if (frameDraws < 50u) {
                 if (++s_lowDrawFrames >= 10u && g_levelUp) {
                     g_levelUp = false;
                     s_sceneSecs = 0;
                     s_installTries = 0;
-                    LogLine("golden_v10: 2D loading/UI transition (10 frames <50 draws) -> reset g_levelUp=false, warmup=180");
+                    LogLine("golden_v10: 2D loading/UI transition (10 frames <50 draws) -> reset g_levelUp=false, warmup=60");
                 }
             } else {
                 s_lowDrawFrames = 0;
             }
         } else {
+            s_lowDraw80Frames = 0;
             s_lowDrawFrames = 0;
         }
     }
@@ -6296,10 +6715,6 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
     // per-second line would have a zero frame count.  probe mode presents every frame, so it always reports.
     if (gate && g_lastFrame.QuadPart != 0 && g_qpcFreq.QuadPart != 0) {
         uint64_t dt_us = (uint64_t)((now.QuadPart - g_lastFrame.QuadPart) * 1000000ULL / g_qpcFreq.QuadPart);
-        if (dt_us > 80000ULL) {
-            g_m2PostLoadWarmup = 180;
-            g_m2CachedValid = 0;
-        }
         uint32_t us32 = (dt_us > 10000000ULL) ? 10000000U : (uint32_t)dt_us;
         g_totalFrames++;
 
@@ -6350,10 +6765,10 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
             if (dpf >= 150.0) {
                 if (++s_sceneSecs >= 3u && !g_levelUp) {
                     g_levelUp = true;
-                    g_m2PostLoadWarmup = 180;
+                    g_m2PostLoadWarmup = 60;
                     g_m2CachedValid = 0;
                     QueryPerformanceCounter(&g_levelUpTick);
-                    LogLine("golden_v10: sustained 3D scene (3s dpf>=150) -> latched g_levelUp=true (warmup=180)");
+                    LogLine("golden_v10: sustained 3D scene (3s dpf>=150) -> latched g_levelUp=true (warmup=60)");
                 }
             } else {
                 s_sceneSecs = 0;
@@ -6416,7 +6831,39 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
             M2_DCTelemetry(total_el);   // M2_PRESENT: per-second presenter line
             M2_QuantTelemetry(total_el);
             M2_DistTelemetry(total_el);
+            M2_EipProfTelemetry(total_el);
+            M2_EipProfLogCumulative();
             M2_TurboHud_UpdateSec(pDevice, total_el, fps, avg_ms, quantMs, gameX);
+            {
+                static uint32_t sSortedUs[4096];
+                uint32_t fn = g_secFrameCount;
+                if (fn > 4096) fn = 4096;
+                double sqDiffSum = 0.0;
+                for (uint32_t i = 0; i < fn; ++i) {
+                    sSortedUs[i] = g_secFrameUs[i];
+                    double dMs = (double)g_secFrameUs[i] / 1000.0 - avg_ms;
+                    sqDiffSum += dMs * dMs;
+                }
+                qsort(sSortedUs, fn, sizeof(uint32_t), M2_DCCmpU32);
+                double min_ms = (double)sSortedUs[0] / 1000.0;
+                double p50_ms = (double)sSortedUs[(fn * 50) / 100] / 1000.0;
+                double p75_ms = (double)sSortedUs[(fn * 75) / 100] / 1000.0;
+                double p90_ms = (double)sSortedUs[(fn * 90) / 100] / 1000.0;
+                double p95_ms = (double)sSortedUs[(fn * 95) / 100] / 1000.0;
+                double p99_ms = (double)sSortedUs[(fn * 99) / 100] / 1000.0;
+                double std_ms = sqrt(sqDiffSum / (double)fn);
+                double one_pct_low_fps = (p99_ms > 0.01) ? (1000.0 / p99_ms) : 0.0;
+                uint32_t stHits = g_stateCacheHits;
+                g_stateCacheHits = 0;
+                int plen = snprintf(line, sizeof(line),
+                                    "# pacing t=%.2f fps=%.1f real_fps=%u replay_fps=%u effK=%d min_ms=%.2f p50_ms=%.2f p75_ms=%.2f p90_ms=%.2f p95_ms=%.2f p99_ms=%.2f max_ms=%.2f std_ms=%.2f one_pct_low_fps=%.1f state_hits=%u\n",
+                                    total_el, fps, g_m2RealFramesLastSec, g_m2ReplayFramesLastSec, g_m2LastEffK,
+                                    min_ms, p50_ms, p75_ms, p90_ms, p95_ms, p99_ms, max_ms, std_ms, one_pct_low_fps, stHits);
+                if (plen > 0) {
+                    DWORD written = 0;
+                    WriteFile(g_logFile, line, (DWORD)plen, &written, NULL);
+                }
+            }
             M2_FrustumLiveSelfTest();
             if (g_ftFile != INVALID_HANDLE_VALUE) {
                 FlushFtBuf();
@@ -6434,8 +6881,10 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_Reset)(void* pDevice, void* pPresentatio
 static PFN_Reset g_origReset = NULL;
 
 static HRESULT STDMETHODCALLTYPE Hook_Reset(void* pDevice, void* pPresentationParameters) {
+    M2_InvalidateStateCache();
     M2_TurboV8_ForcePresentParams120Hz(pPresentationParameters, "Reset");
     HRESULT hr = g_origReset(pDevice, pPresentationParameters);
+    M2_InvalidateStateCache();
     M2_TurboV8_UnlockApp120Fps();
     return hr;
 }
@@ -6484,6 +6933,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(
     BOOL prOk = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     snprintf(m, sizeof(m), "CreateDevice: SetThreadPriority(HIGHEST) ok=%d now=%d", prOk, GetThreadPriority(GetCurrentThread()));
     LogLine(m);
+    StartEipSamplerIfNeeded();
 
     HRESULT hr = g_origCreateDevice(pD3D9, Adapter, DeviceType, hFocusWindow,
                                     BehaviorFlags, pPresentationParameters, ppReturnedDeviceInterface);
@@ -6658,6 +7108,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         } else {
             LogLine("golden_v10: normal mode -> leaving 0x004D46A6 untouched (4-DLC selector enabled)");
         }
+        m2_rust_state_filter_reset();
+        m2_rust_pace_reset(120);
+        LogLine("m2_rust_core: linked and initialized (frustum/state/pacing/simd online)");
     } else if (fdwReason == DLL_THREAD_DETACH) {
         M2A_ThreadDetach();
     } else if (fdwReason == DLL_PROCESS_DETACH) {
