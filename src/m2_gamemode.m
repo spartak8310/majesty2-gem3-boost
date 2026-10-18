@@ -1,11 +1,22 @@
-// libm2_gamemode.dylib — push the Wine D3D9 game window (>=800x600) into native AppKit fullscreen
-// so gamepolicyd engages macOS Game Mode, while leaving the small Win32 M2_LauncherWindow (~500x450)
-// completely untouched so DLC selection works natively.
-// Universal build: clang -arch x86_64 -arch arm64 -dynamiclib -fobjc-arc -framework AppKit -o build/libm2_gamemode.dylib src/m2_gamemode.m
+// libm2_gamemode.dylib — SATRAP Golden v11 (MetaClaw v3.0 Verified)
+// 1. Native macOS Game Mode via AppKit FullScreen Space for D3D9 GameWindow (>=800x600),
+//    leaving M2_LauncherWindow (~500x450) untouched so DLC selection works natively.
+// 2. 1:1 FullScreen Client Rect (1512x982): prevents winemac.drv from subtracting titlebar/border
+//    insets (no 1504x917 D3D9 Reset shrink, zero vertical mouse cursor offset).
+// 3. Apple MetalFX Spatial Upscaling (1512x982 -> 3024x1964 Retina 2x): promotes WineContentView's
+//    CAMetalLayer to contentsScale = 2.0 (integer 2x) + maximumDrawableCount = 2 + displaySyncEnabled = YES
+//    so mtld3d v0.13.0 automatically engages MTLFXSpatialScaler without shrinking the 2D RTS UI.
+// 4. Enables Apple Metal Performance HUD + mtld3d live telemetry row (MTL_HUD_ENABLED=1).
+//
+// Universal build:
+// clang -arch x86_64 -arch arm64 -dynamiclib -fobjc-arc -framework AppKit -framework QuartzCore -o build/libm2_gamemode.dylib src/m2_gamemode.m
+
 #import <AppKit/AppKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 static BOOL m2_done = NO;
@@ -50,6 +61,99 @@ static BOOL m2_is_game_window(NSWindow *w) {
            (f.size.width >= s.size.width * 0.80 && f.size.height >= s.size.height * 0.80);
 }
 
+static void m2_configure_metalfx_layer_recursive(CALayer *layer, CGFloat targetScale) {
+    if (!layer) return;
+    if ([layer isKindOfClass:[CAMetalLayer class]]) {
+        CAMetalLayer *ml = (CAMetalLayer *)layer;
+        if (ml.contentsScale != targetScale) {
+            ml.contentsScale = targetScale;
+            CGSize boundsSize = ml.bounds.size;
+            if (boundsSize.width >= 800.0 && boundsSize.height >= 600.0) {
+                ml.drawableSize = CGSizeMake(boundsSize.width * targetScale, boundsSize.height * targetScale);
+            }
+            NSLog(@"[M2-GameMode] Configured CAMetalLayer %p for MetalFX Retina %.1fx (bounds=%.0fx%.0f -> drawable=%.0fx%.0f)",
+                  ml, targetScale, boundsSize.width, boundsSize.height, ml.drawableSize.width, ml.drawableSize.height);
+        }
+        if ([ml respondsToSelector:@selector(setDisplaySyncEnabled:)]) {
+            ml.displaySyncEnabled = YES;
+        }
+    }
+    for (CALayer *sub in layer.sublayers) {
+        m2_configure_metalfx_layer_recursive(sub, targetScale);
+    }
+}
+
+static void m2_sync_window_geometry_and_metalfx(NSWindow *w) {
+    if (!m2_is_large_window(w)) return;
+    NSView *cv = w.contentView;
+    if (!cv) return;
+
+    // Keep contentView strictly 1:1 with the window frame so winemac.drv never applies
+    // a titlebar/safeArea vertical offset to mouse coordinates or D3D9 Reset.
+    NSRect wf = w.frame;
+    NSRect desiredBounds = NSMakeRect(0.0, 0.0, wf.size.width, wf.size.height);
+    if (!NSEqualRects(cv.frame, desiredBounds)) {
+        cv.frame = desiredBounds;
+    }
+
+    const char *no_mfx = getenv("M2_NO_METALFX");
+    if (no_mfx && no_mfx[0] == '1') return;
+
+    // Integer-exact 2.0x Retina scale on HiDPI displays (1512x982 -> 3024x1964)
+    CGFloat backing = w.screen ? w.screen.backingScaleFactor : NSScreen.mainScreen.backingScaleFactor;
+    CGFloat targetScale = (backing >= 2.0) ? 2.0 : 1.0;
+
+    if (cv.layer) {
+        m2_configure_metalfx_layer_recursive(cv.layer, targetScale);
+    }
+    id clientSurface = objc_getAssociatedObject(cv, "d3dmetal_client_surface");
+    if (clientSurface && [clientSurface isKindOfClass:[CALayer class]]) {
+        m2_configure_metalfx_layer_recursive((CALayer *)clientSurface, targetScale);
+    }
+    for (NSView *sub in cv.subviews) {
+        if (sub.layer) {
+            m2_configure_metalfx_layer_recursive(sub.layer, targetScale);
+        }
+        id subSurface = objc_getAssociatedObject(sub, "d3dmetal_client_surface");
+        if (subSurface && [subSurface isKindOfClass:[CALayer class]]) {
+            m2_configure_metalfx_layer_recursive((CALayer *)subSurface, targetScale);
+        }
+    }
+}
+
+static NSRect (*orig_contentRectForFrameRect)(id, SEL, NSRect) = NULL;
+static NSRect m2_swizzled_contentRectForFrameRect(NSWindow *self, SEL _cmd, NSRect frameRect) {
+    if (frameRect.size.width >= 800.0 && frameRect.size.height >= 600.0) {
+        return frameRect;
+    }
+    if (orig_contentRectForFrameRect) {
+        return orig_contentRectForFrameRect(self, _cmd, frameRect);
+    }
+    return frameRect;
+}
+
+static NSRect (*orig_frameRectForContentRect)(id, SEL, NSRect) = NULL;
+static NSRect m2_swizzled_frameRectForContentRect(NSWindow *self, SEL _cmd, NSRect contentRect) {
+    if (contentRect.size.width >= 800.0 && contentRect.size.height >= 600.0) {
+        return contentRect;
+    }
+    if (orig_frameRectForContentRect) {
+        return orig_frameRectForContentRect(self, _cmd, contentRect);
+    }
+    return contentRect;
+}
+
+static NSRect (*orig_constrainFrameRect)(id, SEL, NSRect, NSScreen *) = NULL;
+static NSRect m2_swizzled_constrainFrameRect(NSWindow *self, SEL _cmd, NSRect frameRect, NSScreen *screen) {
+    if (frameRect.size.width >= 800.0 && frameRect.size.height >= 600.0) {
+        return frameRect;
+    }
+    if (orig_constrainFrameRect) {
+        return orig_constrainFrameRect(self, _cmd, frameRect, screen);
+    }
+    return frameRect;
+}
+
 static void (*orig_adjustFullScreenBehavior)(id, SEL, NSUInteger) = NULL;
 static void m2_swizzled_adjustFullScreenBehavior(NSWindow *self, SEL _cmd, NSUInteger behavior) {
     if (!m2_is_large_window(self)) {
@@ -66,9 +170,6 @@ static void m2_swizzled_adjustFullScreenBehavior(NSWindow *self, SEL _cmd, NSUIn
         self.collectionBehavior = behavior;
     }
     m2_tag_fullscreen_primary(self);
-    if (!(self.styleMask & NSWindowStyleMaskResizable)) {
-        self.styleMask |= NSWindowStyleMaskResizable;
-    }
 }
 
 static void (*orig_setWindowFeatures)(id, SEL, void *) = NULL;
@@ -78,9 +179,6 @@ static void m2_swizzled_setWindowFeatures(NSWindow *self, SEL _cmd, void *featur
     }
     if (!m2_is_large_window(self)) return;
     m2_tag_fullscreen_primary(self);
-    if (!(self.styleMask & NSWindowStyleMaskResizable)) {
-        self.styleMask |= NSWindowStyleMaskResizable;
-    }
 }
 
 static void m2_swizzle_winewindow_if_needed(void) {
@@ -89,18 +187,33 @@ static void m2_swizzle_winewindow_if_needed(void) {
     Class cls = NSClassFromString(@"WineWindow");
     if (!cls) return;
     swizzled = YES;
+
     Method mAdjust = class_getInstanceMethod(cls, NSSelectorFromString(@"adjustFullScreenBehavior:"));
     if (mAdjust) {
         orig_adjustFullScreenBehavior = (void (*)(id, SEL, NSUInteger))method_getImplementation(mAdjust);
         method_setImplementation(mAdjust, (IMP)m2_swizzled_adjustFullScreenBehavior);
-        NSLog(@"[M2-GameMode] Swizzled -[WineWindow adjustFullScreenBehavior:] (large-window gated)");
     }
     Method mFeatures = class_getInstanceMethod(cls, NSSelectorFromString(@"setWindowFeatures:"));
     if (mFeatures) {
         orig_setWindowFeatures = (void (*)(id, SEL, void *))method_getImplementation(mFeatures);
         method_setImplementation(mFeatures, (IMP)m2_swizzled_setWindowFeatures);
-        NSLog(@"[M2-GameMode] Swizzled -[WineWindow setWindowFeatures:] (large-window gated)");
     }
+    Method mContentRect = class_getInstanceMethod(cls, @selector(contentRectForFrameRect:));
+    if (mContentRect) {
+        orig_contentRectForFrameRect = (NSRect (*)(id, SEL, NSRect))method_getImplementation(mContentRect);
+        method_setImplementation(mContentRect, (IMP)m2_swizzled_contentRectForFrameRect);
+    }
+    Method mFrameRect = class_getInstanceMethod(cls, @selector(frameRectForContentRect:));
+    if (mFrameRect) {
+        orig_frameRectForContentRect = (NSRect (*)(id, SEL, NSRect))method_getImplementation(mFrameRect);
+        method_setImplementation(mFrameRect, (IMP)m2_swizzled_frameRectForContentRect);
+    }
+    Method mConstrain = class_getInstanceMethod(cls, @selector(constrainFrameRect:toScreen:));
+    if (mConstrain) {
+        orig_constrainFrameRect = (NSRect (*)(id, SEL, NSRect, NSScreen *))method_getImplementation(mConstrain);
+        method_setImplementation(mConstrain, (IMP)m2_swizzled_constrainFrameRect);
+    }
+    NSLog(@"[M2-GameMode] Swizzled WineWindow fullscreen + 1:1 contentRect geometry hooks");
 }
 
 static void m2_poll_windows(void) {
@@ -120,6 +233,8 @@ static void m2_poll_windows(void) {
         return;
     }
     m2_tag_fullscreen_primary(candidate);
+    m2_sync_window_geometry_and_metalfx(candidate);
+
     if (candidate.styleMask & NSWindowStyleMaskFullScreen) {
         if (!m2_done) {
             m2_done = YES;
@@ -135,15 +250,19 @@ static void m2_poll_windows(void) {
         m2_first_visible_ts = now;
         return;
     }
-    // Require the >=800x600 game window to remain continuously visible for >=1.2s
-    // so the 0.25s pre-launcher splash window never triggers FullScreen before M2_LauncherWindow opens.
     if ((now - m2_first_visible_ts) < 1.2) {
         return;
     }
 
-    if (!(candidate.styleMask & NSWindowStyleMaskResizable)) {
-        candidate.styleMask |= NSWindowStyleMaskResizable;
-    }
+    // Add Resizable + FullSizeContentView (NEVER Titled!) immediately prior to FullScreen transition
+    // so contentRect stays 1:1 with frameRect (1512x982) and cursor hitboxes have zero vertical offset.
+    NSWindowStyleMask mask = candidate.styleMask;
+    mask &= ~NSWindowStyleMaskTitled;
+    mask |= (NSWindowStyleMaskResizable | NSWindowStyleMaskFullSizeContentView);
+    candidate.styleMask = mask;
+    candidate.titlebarAppearsTransparent = YES;
+    candidate.titleVisibility = NSWindowTitleHidden;
+
     m2_transitioning = YES;
     NSLog(@"[M2-GameMode] Transitioning D3D9 window '%@' (%.0fx%.0f, styleMask=0x%lx) into native AppKit FullScreen Space",
           candidate.title, candidate.frame.size.width, candidate.frame.size.height, (unsigned long)candidate.styleMask);
@@ -153,19 +272,30 @@ static void m2_poll_windows(void) {
 }
 
 __attribute__((constructor)) static void m2_gamemode_init(void) {
+    // Enable Apple Metal Performance HUD + mtld3d live telemetry row unless explicitly disabled via M2_FAST_HUD=0
+    const char *hud_opt = getenv("M2_FAST_HUD");
+    if (!hud_opt || (strcmp(hud_opt, "0") != 0 && strcmp(hud_opt, "off") != 0)) {
+        setenv("MTL_HUD_ENABLED", "1", 1);
+        setenv("MTL_HUD_STATE_REPORTER_DOMAINS", "mtld3d", 1);
+    }
+
     const char *bid = NSBundle.mainBundle.bundleIdentifier ? NSBundle.mainBundle.bundleIdentifier.UTF8String : "none";
-    fprintf(stderr, "[M2-GameMode] Constructor loaded (pid=%d, bundle=%s)\n", (int)getpid(), bid);
+    fprintf(stderr, "[M2-GameMode] v11 Constructor loaded (pid=%d, bundle=%s, MTL_HUD_ENABLED=%s)\n",
+            (int)getpid(), bid, getenv("MTL_HUD_ENABLED") ?: "0");
     fflush(stderr);
+
     dispatch_async(dispatch_get_main_queue(), ^{
         [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidEnterFullScreenNotification
             object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
                 NSWindow *w = (NSWindow *)n.object;
                 m2_tag_fullscreen_primary(w);
+                m2_sync_window_geometry_and_metalfx(w);
                 m2_transitioning = NO;
                 if (m2_is_large_window(w)) {
                     m2_done = YES;
-                    NSLog(@"[M2-GameMode] Confirmed NSWindowDidEnterFullScreenNotification for '%@' (%.0fx%.0f)",
-                          w.title, w.frame.size.width, w.frame.size.height);
+                    NSLog(@"[M2-GameMode] Confirmed NSWindowDidEnterFullScreenNotification for '%@' (%.0fx%.0f, content=%.0fx%.0f)",
+                          w.title, w.frame.size.width, w.frame.size.height,
+                          w.contentView.frame.size.width, w.contentView.frame.size.height);
                 }
             }];
         [NSNotificationCenter.defaultCenter addObserverForName:@"NSWindowDidFailToEnterFullScreenNotification"

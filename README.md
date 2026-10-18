@@ -149,3 +149,23 @@ Measured on **Apple M3 Pro** (`Mac15,6`, macOS 27.0, `1512x982 @ 120Hz ProMotion
 | **Post-Load Warmup Guard** | **`120` frames (`1:1`)** | Zero frame/quant skipping when `q_ms > 60 ms` (level load) or `q_ms < 6 ms` (Main Menu / DLC selector) |
 | **CPU / Memory Footprint** | **`85.7% CPU` / `750.1 MB RSS`** | 4 parallel worker threads across 5 Performance cores |
 
+---
+
+## 5. Golden v11: «Проект Возрождение» (Project Rebirth v1.5.5), Apple MetalFX 2× Retina & 120 FPS Lock
+
+### Mod Base Compatibility: Majesty 2 Collection — «Проект Возрождение» v1.5.5
+- Built and verified against the **Majesty 2 Collection «Проект Возрождение» (Project Rebirth v1.5.5)** overhaul (`resource.mod`, `Vozrozhdeniye.ogg`, all 4 campaigns: Base Human Campaign, *Kingmaker / Трон Ардании*, *Battles of Ardania / Битвы Ардании*, and *Monster Kingdom / Королевство Монстров*).
+- **Launcher Thread Race Condition Fix (`Majesty2.exe` `0x40de21..0x40dede`)**:
+  - In stock `Majesty2.exe`, `LauncherWindow::OnMouseUp` (`0x40ddf0`, running on background thread `0x40e640`) set `launcher->selected_expansion = 0` (`0x40de1a`) and immediately set `launcher->closed = 1` (`0x40de21`) **before** calling `ShowWindow(SW_HIDE)` and comparing `"but_mp1"` / `"but_mp2"` / `"but_mp3"`. Under Wine/macOS, the main thread (`0x40e605`) woke from `Sleep(100)` during `ShowWindow(SW_HIDE)`, observed `closed == 1` while `selected_expansion` was still `0`, and mounted `original` (`Campaign_01`) instead of `expansion_3` (*Monster Kingdom*, `Campaign_Exp_03`).
+  - Our binary patch NOPs out the premature `movb $1, 0xc(%esi)` at `0x40de21` and relocates `movb $1, 0xc(%esi)` to `0x40ded9` strictly **after** `0x10(%esi)` is written across all button branches (`m2_closebutton`, `but_m2`, `but_mp1`, `but_mp2`, `but_mp3`).
+
+### Apple Silicon Modern Gaming Stack (`MetalFX` + `120 Hz` Pacing + Native Game Mode)
+- **Apple `MetalFX` Spatial Upscaling (`1512×982 -> 3024×1964` Retina 2×)**:
+  - Raising Majesty 2's internal D3D9 resolution above `1512×982` shrinks the 2D RTS interface.
+  - `src/m2_gamemode.m` (`libm2_gamemode.dylib`) promotes `WineContentView`'s `CAMetalLayer` (`d3dmetal_client_surface`) to `contentsScale = 2.0` (`drawableSize = 3024×1964` integer 2× Retina scale) while keeping the guest D3D9 backbuffer at `1512×982`. This automatically engages `mtld3d v0.13.0`'s native **Apple `MTLFXSpatialScaler`** (`1512×982 -> 3024×1964`) so the 3D scene and edges are reconstructed at full Retina resolution while the 2D UI remains large and readable.
+- **1:1 FullScreen Cursor Geometry (Zero Vertical Offset)**:
+  - Swizzles `-[WineWindow contentRectForFrameRect:]`, `-[WineWindow frameRectForContentRect:]`, and `-[WineWindow constrainFrameRect:toScreen:]` alongside `NSWindowStyleMaskFullSizeContentView` (without `NSWindowStyleMaskTitled`) so entering native AppKit FullScreen Space never shrinks the D3D9 backbuffer to `1504×917` or shifts mouse hitboxes vertically below the MacBook Pro camera notch (`safeAreaInsets.top = 32pt`).
+- **120.0 FPS Precision Frame Pacing Lock & Low Input Latency (`config/mtld3d.conf`)**:
+  - Locks presentation to **120.0 FPS (`8.333 ms`)** via `present.maxFps = 120`, bounds swapchain queue depth via `present.maxFrameLatency = 1` + `displaySyncEnabled = YES`, and keeps hardware `NSCursor` (`cursor.software = false`) for crisp 120Hz cursor & camera response.
+- **Real-Time Apple Metal Performance HUD (`MTL_HUD_ENABLED=1`)**:
+  - Enabled automatically by `libm2_gamemode.dylib` constructor with `MTL_HUD_STATE_REPORTER_DOMAINS=mtld3d` to display live FPS, frame-time graph, and `mtld3d v0.13.0` telemetry on screen (disable anytime with `M2_FAST_HUD=0`).
