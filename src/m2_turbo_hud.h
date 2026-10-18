@@ -20,20 +20,121 @@ static int g_m2HdrMode = 0;
 static int g_m2HdrDirty = 0;
 static volatile uint32_t g_m2AnisoUpgrades = 0;
 
-// [F10] Sub-Tick Quant-Render Decoupler (decouples Visual/Camera 120 FPS from eApplication::Quant)
-// 0 = OFF (1:1 stock), 1 = 2x Adaptive 120Hz (Default, triggers when Quant >= 3.5ms), 2 = 3x Ultra 120Hz (always active!)
+// [F10] Sub-Tick Quant+RenderRC Decoupler (decouples BOTH eApplication::Quant and eApplication::RenderRC via GPU StretchRect Replay)
+// 0 = OFF (1:1 stock), 1 = 3x Adaptive 120Hz (Default), 2 = 4x Ultra 120Hz
 static int g_m2DecoupleMode = 1;
 static int g_m2DecoupleSkipPhase = 0;
 static int g_m2DecoupleAccumMs = 0;
-static double g_m2LastRealQuantMs = 0.0;
+// g_m2LastRealQuantMs forward-declared in d3d9_proxy.cpp
 static volatile uint32_t g_m2DecoupleSkipped = 0;
 static uint32_t g_m2DecoupleSkippedLastSec = 0;
+static volatile LONG g_m2SubFrameSkipRender = 0;
+static volatile LONG g_m2DidSkipRenderRC = 0;
+static volatile uint32_t g_m2DecoupleSkippedRenders = 0;
+static uint32_t g_m2DecoupleSkippedRendersLastSec = 0;
+static void* g_m2CachedSurf = NULL;
+static void* g_m2LastDevice = NULL;
+static int g_m2CachedW = 0;
+static int g_m2CachedH = 0;
+static DWORD g_m2CachedFmt = 0;
+static int g_m2CachedValid = 0;
 
-// 120 FPS Unlocker state (app.dll Sleep(3)->NOP + pro_sleepRender=0 + r_waitForRenderDone=0 + VSync OFF)
+// 120 FPS Unlocker state (app.dll Sleep(3)->NOP + pro_sleepRender=0 + r_waitForRenderDone=0 + VSync OFF + RenderScreen Hook)
 static int g_m2Unlock120Installed = 0;
+static int g_m2RenderRCHookInstalled = 0;
 static int g_m2AppSleepPatched = 0;
 static HMODULE g_m2AppMod = NULL;
 static uint32_t g_m2ToastFrames = 180; // Show visual indicator bar for first 180 frames and on every F8-F11 keypress
+
+struct M2_D3DSURFACE_DESC_V10 {
+    DWORD Format; DWORD Type; DWORD Usage; DWORD Pool;
+    DWORD MultiSampleType; DWORD MultiSampleQuality;
+    UINT Width; UINT Height;
+};
+
+typedef void (__thiscall *PFN_M2RealRenderScreen)(void*);
+static PFN_M2RealRenderScreen g_m2RealRenderScreen = NULL;
+
+static void __fastcall M2_HookedRenderScreen(void* thisPtr, void* edx) {
+    (void)edx;
+    if (g_m2SubFrameSkipRender && g_m2CachedValid && g_m2CachedSurf != NULL && g_m2LastDevice != NULL && g_levelUp) {
+        g_m2DidSkipRenderRC = 1;
+        g_m2DecoupleSkippedRenders++;
+        Hook_Present(g_m2LastDevice, NULL, NULL, NULL, NULL);
+        g_m2DidSkipRenderRC = 0;
+        g_m2SubFrameSkipRender = 0;
+        return;
+    }
+    g_m2DidSkipRenderRC = 0;
+    if (g_m2RealRenderScreen) {
+        g_m2RealRenderScreen(thisPtr);
+    } else {
+        void** vtbl = *(void***)thisPtr;
+        ((PFN_M2RealRenderScreen)vtbl[5])(thisPtr);
+    }
+}
+
+static inline void M2_TurboV10_OnBeforeReset(void) {
+    if (g_m2CachedSurf) {
+        void** svtbl = *(void***)g_m2CachedSurf;
+        typedef ULONG (STDMETHODCALLTYPE *PFN_Release)(void*);
+        if (svtbl && svtbl[2]) ((PFN_Release)svtbl[2])(g_m2CachedSurf);
+        g_m2CachedSurf = NULL;
+    }
+    g_m2CachedValid = 0;
+    g_m2SubFrameSkipRender = 0;
+    g_m2DidSkipRenderRC = 0;
+}
+
+static inline void M2_TurboV10_OnBeforePresent(void* device) {
+    if (!device) return;
+    static LARGE_INTEGER s_lastPresent = {0};
+    static LARGE_INTEGER s_freq = {0};
+    if (s_freq.QuadPart == 0) QueryPerformanceFrequency(&s_freq);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (s_lastPresent.QuadPart != 0 && s_freq.QuadPart != 0) {
+        double dt_ms = (double)(now.QuadPart - s_lastPresent.QuadPart) * 1000.0 / (double)s_freq.QuadPart;
+        if (dt_ms < 8.1 && g_m2LastRealQuantMs < 4.0) {
+            Sleep(1);
+            QueryPerformanceCounter(&now);
+        }
+    }
+    s_lastPresent = now;
+    g_m2LastDevice = device;
+    void** vtbl = *(void***)device;
+    if (!vtbl || !vtbl[18] || !vtbl[28] || !vtbl[34]) return;
+    typedef HRESULT (STDMETHODCALLTYPE *PFN_GetBackBuffer)(void*, UINT, UINT, DWORD, void**);
+    typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateRenderTarget)(void*, UINT, UINT, DWORD, DWORD, DWORD, BOOL, void**, HANDLE*);
+    typedef HRESULT (STDMETHODCALLTYPE *PFN_StretchRect)(void*, void*, const void*, void*, const void*, DWORD);
+    typedef ULONG   (STDMETHODCALLTYPE *PFN_Release)(void*);
+    typedef HRESULT (STDMETHODCALLTYPE *PFN_GetDesc)(void*, M2_D3DSURFACE_DESC_V10*);
+    void* bb = NULL;
+    if (FAILED(((PFN_GetBackBuffer)vtbl[18])(device, 0, 0, 0, &bb)) || !bb) return;
+    void** bvtbl = *(void***)bb;
+    M2_D3DSURFACE_DESC_V10 desc;
+    memset(&desc, 0, sizeof(desc));
+    if (bvtbl && bvtbl[12] && SUCCEEDED(((PFN_GetDesc)bvtbl[12])(bb, &desc)) && desc.Width > 0 && desc.Height > 0) {
+        if (!g_m2CachedSurf || g_m2CachedW != (int)desc.Width || g_m2CachedH != (int)desc.Height || g_m2CachedFmt != desc.Format) {
+            M2_TurboV10_OnBeforeReset();
+            if (SUCCEEDED(((PFN_CreateRenderTarget)vtbl[28])(device, desc.Width, desc.Height, desc.Format, 0, 0, FALSE, &g_m2CachedSurf, NULL))) {
+                g_m2CachedW = (int)desc.Width;
+                g_m2CachedH = (int)desc.Height;
+                g_m2CachedFmt = desc.Format;
+            }
+        }
+        if (g_m2CachedSurf) {
+            if (g_m2DidSkipRenderRC && g_m2CachedValid) {
+                ((PFN_StretchRect)vtbl[34])(device, g_m2CachedSurf, NULL, bb, NULL, 0);
+            } else if (!g_m2DidSkipRenderRC) {
+                if (SUCCEEDED(((PFN_StretchRect)vtbl[34])(device, bb, NULL, g_m2CachedSurf, NULL, 0))) {
+                    g_m2CachedValid = 1;
+                }
+            }
+        }
+    }
+    if (bvtbl && bvtbl[2]) ((PFN_Release)bvtbl[2])(bb);
+}
 
 static inline const char* M2_HdrModeName(int m) {
     switch (m & 3) {
@@ -48,10 +149,10 @@ static inline const char* M2_HdrModeName(int m) {
 static inline const char* M2_DecoupleModeName(int m) {
     switch (m % 3) {
         case 0: return "1:1(OFF)";
-        case 1: return "2x(120Hz-Auto)";
-        case 2: return "3x(120Hz-Force)";
+        case 1: return "Auto-120Hz";
+        case 2: return "Ultra-120Hz";
     }
-    return "2x";
+    return "Auto-120Hz";
 }
 
 static inline void M2_TurboV9_TickUnlock(void) {
@@ -65,6 +166,7 @@ static inline void M2_TurboV9_TickUnlock(void) {
 }
 
 static inline void M2_TurboHud_OnPresent(void* pDevice) {
+    (void)pDevice;
     M2_TurboV9_TickUnlock();
 }
 
@@ -75,22 +177,49 @@ static inline void M2_TurboV8_UnlockApp120Fps(void) {
     if (!g_m2AppMod) return;
     uint8_t* base = (uint8_t*)g_m2AppMod;
 
-    // 1. Patch app.dll!eApplication::Working (RVA 0x13ba6): 6a 03 ff 15 (push 3; call [Sleep]) -> 8x NOP
+    // 1. Patch Majesty2.exe main loop 15ms (60 FPS) Sleep limiter at VA 0x0087ba9c (7c 07 52 ff 15 18 c1 87 00 -> eb 07 NOPs)
+    //    AND app.dll!eApplication::Working RVA +0x13ba6 (Sleep(3) -> 8x NOP)
     if (!g_m2Unlock120Installed) {
+        uint8_t* pExeSleep = (uint8_t*)0x0087ba9c;
+        if (pExeSleep[0] == 0x7C && pExeSleep[1] == 0x07 && pExeSleep[2] == 0x52 && pExeSleep[3] == 0xFF && pExeSleep[4] == 0x15) {
+            DWORD oldProtE = 0;
+            if (VirtualProtect(pExeSleep, 16, PAGE_EXECUTE_READWRITE, &oldProtE)) {
+                pExeSleep[0] = 0xEB; // jmp short +7 (unconditionally skip Sleep(15 - elapsed_ms)!)
+                for (int k = 2; k < 9; ++k) pExeSleep[k] = 0x90;
+                VirtualProtect(pExeSleep, 16, oldProtE, &oldProtE);
+                FlushInstructionCache(GetCurrentProcess(), pExeSleep, 16);
+                LogLine("turbo_v10: patched Majesty2.exe VA 0x0087ba9c (removed 15ms 60FPS Sleep limiter -> TRUE 120Hz unlocked!)");
+            }
+        }
         uint8_t* pSleep = base + 0x13ba6;
         if (pSleep[0] == 0x6A && pSleep[1] == 0x03 && pSleep[2] == 0xFF && pSleep[3] == 0x15) {
             DWORD oldProt = 0;
             if (VirtualProtect(pSleep, 8, PAGE_EXECUTE_READWRITE, &oldProt)) {
                 for (int k = 0; k < 8; ++k) pSleep[k] = 0x90;
                 VirtualProtect(pSleep, 8, oldProt, &oldProt);
-                LogLine("turbo_v9: patched app.dll!eApplication::Working RVA +0x13ba6 (Sleep(3) -> 8x NOP for 120Hz ProMotion)");
+                LogLine("turbo_v10: patched app.dll!eApplication::Working RVA +0x13ba6 (Sleep(3) -> 8x NOP)");
             }
         }
         g_m2Unlock120Installed = 1;
         g_m2AppSleepPatched = 1;
     }
 
-    // 2. Clear pro_sleepRender (+0x31df0) and r_waitForRenderDone (+0x31e20) as 32-bit uint32_t after VirtualProtect RW
+    // 2. Hook Majesty2.exe IAT slot 0x0087cc44 (app.dll!?RenderScreen@eApplication@xApp@@UAEXXZ called at 0x0087bbb5)
+    if (!g_m2RenderRCHookInstalled) {
+        g_m2RealRenderScreen = (PFN_M2RealRenderScreen)GetProcAddress(g_m2AppMod, "?RenderScreen@eApplication@xApp@@UAEXXZ");
+        void** pIatSlot = (void**)0x0087cc44;
+        if (g_m2RealRenderScreen && *pIatSlot == (void*)g_m2RealRenderScreen) {
+            DWORD oldProt2 = 0;
+            if (VirtualProtect(pIatSlot, sizeof(void*), PAGE_READWRITE, &oldProt2)) {
+                *pIatSlot = (void*)&M2_HookedRenderScreen;
+                VirtualProtect(pIatSlot, sizeof(void*), oldProt2, &oldProt2);
+                LogLine("turbo_v10: hooked Majesty2.exe IAT 0x0087cc44 app.dll!eApplication::RenderScreen (Sub-Frame RenderScreen Skip + StretchRect Replay)");
+            }
+        }
+        g_m2RenderRCHookInstalled = 1;
+    }
+
+    // 3. Clear pro_sleepRender (+0x31df0) and r_waitForRenderDone (+0x31e20) as 32-bit uint32_t after VirtualProtect RW
     DWORD oldProt = 0;
     if (VirtualProtect(base + 0x31df0, 0x100, PAGE_READWRITE, &oldProt)) {
         *(volatile uint32_t*)(base + 0x31df0) = 0;
@@ -103,6 +232,9 @@ static inline void M2_TurboV8_UnlockApp120Fps(void) {
 }
 
 static inline void M2_TurboV8_ForcePresentParams120Hz(void* pPresentationParameters, const char* caller) {
+    if (caller && caller[0] == 'R') {
+        M2_TurboV10_OnBeforeReset();
+    }
     if (!pPresentationParameters) return;
     DWORD* pp = (DWORD*)pPresentationParameters;
     DWORD origInterval = pp[13];
@@ -110,12 +242,13 @@ static inline void M2_TurboV8_ForcePresentParams120Hz(void* pPresentationParamet
     char ev[8] = {0};
     if (!(GetEnvironmentVariableA("M2_VSYNC", ev, sizeof(ev)) > 0 && ev[0] == '1')) {
         pp[13] = 0x80000000UL; // D3DPRESENT_INTERVAL_IMMEDIATE
+        if (pp[5] < 2) pp[5] = 2; // BackBufferCount = 2 (triple buffering to avoid CAMetalLayer drawable wait)
         if (pp[8] == 0 && pp[12] > 0 && pp[12] < 120) {
             pp[12] = 0;
         }
         char m[192];
-        snprintf(m, sizeof(m), "turbo_v8: %s unlocked 120Hz (presentInterval 0x%lX -> 0x%lX IMMEDIATE, refreshHz %lu -> %lu)",
-                 caller, (unsigned long)origInterval, (unsigned long)pp[13], (unsigned long)origHz, (unsigned long)pp[12]);
+        snprintf(m, sizeof(m), "turbo_v10: %s unlocked 120Hz (presentInterval 0x%lX -> 0x%lX IMMEDIATE, refreshHz %lu -> %lu, backbuffers=%lu)",
+                 caller, (unsigned long)origInterval, (unsigned long)pp[13], (unsigned long)origHz, (unsigned long)pp[12], (unsigned long)pp[5]);
         LogLine(m);
     }
 }
@@ -147,19 +280,36 @@ static inline void M2_OnAnisoUpgrade(void) {
     g_m2AnisoUpgrades++;
 }
 
+// g_m2PostLoadWarmup forward-declared in d3d9_proxy.cpp
+static int g_m2DidSkipQuant = 0;
+
 static inline int M2_DecoupleFilterQuant(int levelUp, int fdtMs, int detOn, int ms, int* outEffMs) {
     M2_TurboV7_InitEnv();
     M2_TurboV8_UnlockApp120Fps();
     *outEffMs = ms;
-    // Decoupler does NOT require levelUp strictly set by -autostart
-    if (g_m2DecoupleMode <= 0 || fdtMs > 0 || detOn) {
+    if (!levelUp || g_m2DecoupleMode <= 0 || fdtMs > 0 || detOn || !g_m2CachedValid || !g_m2CachedSurf || !g_m2LastDevice) {
         g_m2DecoupleSkipPhase = 0;
         g_m2DecoupleAccumMs = 0;
+        g_m2SubFrameSkipRender = 0;
+        g_m2DidSkipRenderRC = 0;
+        g_m2DidSkipQuant = 0;
         return 0;
     }
-    const float threshMs = (g_m2DecoupleMode == 2) ? 0.1f : 0.4f;
-    if (g_m2LastRealQuantMs < (double)threshMs) {
+    if (g_m2PostLoadWarmup > 0) {
+        g_m2PostLoadWarmup--;
         g_m2DecoupleSkipPhase = 0;
+        g_m2DecoupleAccumMs = 0;
+        g_m2SubFrameSkipRender = 0;
+        g_m2DidSkipRenderRC = 0;
+        g_m2DidSkipQuant = 0;
+        return 0;
+    }
+    const double threshMs = (g_m2DecoupleMode == 2) ? 0.05 : 6.0;
+    if (g_m2LastRealQuantMs < threshMs) {
+        g_m2DecoupleSkipPhase = 0;
+        g_m2SubFrameSkipRender = 0;
+        g_m2DidSkipRenderRC = 0;
+        g_m2DidSkipQuant = 0;
         if (g_m2DecoupleAccumMs > 0) {
             int tot = ms + g_m2DecoupleAccumMs;
             g_m2DecoupleAccumMs = 0;
@@ -167,16 +317,28 @@ static inline int M2_DecoupleFilterQuant(int levelUp, int fdtMs, int detOn, int 
         }
         return 0;
     }
-    int maxSkip = (g_m2DecoupleMode >= 2) ? 2 : 1;
+    int maxSkip = 2;
+    if (g_m2DecoupleMode >= 2) {
+        maxSkip = 11;
+    } else {
+        if (g_m2LastRealQuantMs >= 24.0) maxSkip = 4;      // 5x
+        else if (g_m2LastRealQuantMs >= 14.0) maxSkip = 3; // 4x
+        else maxSkip = 2;                                  // 3x
+    }
     if (g_m2DecoupleSkipPhase < maxSkip) {
         g_m2DecoupleSkipPhase++;
         int addMs = (ms > 0 && ms < 200) ? ms : 8;
         g_m2DecoupleAccumMs += addMs;
         g_m2DecoupleSkipped++;
+        g_m2SubFrameSkipRender = 1;
+        g_m2DidSkipQuant = 1;
         g_r3Cam = 1;
         return 1;
     }
     g_m2DecoupleSkipPhase = 0;
+    g_m2SubFrameSkipRender = 0;
+    g_m2DidSkipRenderRC = 0;
+    g_m2DidSkipQuant = 0;
     int tot = ms + g_m2DecoupleAccumMs;
     g_m2DecoupleAccumMs = 0;
     if (tot > 180) tot = 180;
@@ -184,9 +346,13 @@ static inline int M2_DecoupleFilterQuant(int levelUp, int fdtMs, int detOn, int 
     return 0;
 }
 
-static inline void M2_DecoupleRecordQuantMs(double qMs) {
-    if (g_m2LastRealQuantMs <= 0.05) g_m2LastRealQuantMs = qMs;
-    else g_m2LastRealQuantMs = g_m2LastRealQuantMs * 0.65 + qMs * 0.35;
+static inline void M2_DecoupleRecordQuantMs(double q_ms) {
+    if (q_ms > 60.0) {
+        g_m2PostLoadWarmup = 120;
+        g_m2LastRealQuantMs = 0.0;
+    } else {
+        g_m2LastRealQuantMs = (g_m2LastRealQuantMs <= 0.1) ? q_ms : (g_m2LastRealQuantMs * 0.7 + q_ms * 0.3);
+    }
 }
 
 typedef void    (STDMETHODCALLTYPE *PFN_M2SetGammaRamp)(void* pDevice, UINT iSwapChain, DWORD Flags, const void* pRamp);
@@ -285,12 +451,13 @@ static inline void M2_TurboHud_RefreshTitleNow(void) {
     if (!wnd || !IsWindow(wnd)) return;
     char title[320];
     snprintf(title, sizeof(title),
-             "Majesty 2 [TURBO v9 120Hz] | %.1f FPS (%.1fms) | Quant: %.1fms (%.1fx) | [F8] %s | [F9] SSE2:%s | [F10] Decouple:%s(skip:%u/s) | [F11] Cam:%s",
+             "Majesty 2 [TURBO v10 120Hz] | %.1f FPS (%.1fms) | Quant: %.1fms (%.1fx) | [F8] %s | [F9] SSE2:%s | [F10] Decouple:%s(skip:%u/%u) | [F11] Cam:%s",
              g_m2LastFps, g_m2LastAvgMs, g_m2LastQuantMs, g_m2LastGameX > 0.0 ? g_m2LastGameX : 1.0,
              M2_HdrModeName(g_m2HdrMode),
              g_w6LiveEnabled ? "ON(13)" : "OFF",
              M2_DecoupleModeName(g_m2DecoupleMode),
              g_m2DecoupleSkippedLastSec,
+             g_m2DecoupleSkippedRendersLastSec,
              g_r3Cam ? "ON" : "OFF");
     SetWindowTextA(wnd, title);
 }
@@ -365,19 +532,22 @@ static inline void M2_TurboHud_UpdateSec(void* pDevice, double total_el, double 
     g_m2LastQuantMs = quant_ms;
     g_m2LastGameX = game_x;
     uint32_t sk = g_m2DecoupleSkipped;
+    uint32_t skr = g_m2DecoupleSkippedRenders;
     uint32_t an = g_m2AnisoUpgrades;
     g_m2DecoupleSkipped = 0;
+    g_m2DecoupleSkippedRenders = 0;
     g_m2AnisoUpgrades = 0;
     g_m2DecoupleSkippedLastSec = sk;
+    g_m2DecoupleSkippedRendersLastSec = skr;
     if (g_m2HdrMode == 1 || g_m2HdrMode == 2) {
         M2_TurboHud_ApplyHdrRamp(pDevice);
     }
     if (g_logFile != INVALID_HANDLE_VALUE) {
-        char line[256];
+        char line[280];
         int len = snprintf(line, sizeof(line),
-                           "# turbo_v8 t=%.2f fps=%.1f hdr_mode=%d(%s) aniso_upgrades=%u decouple_mode=%d(%s) decouple_skipped_quants=%u last_real_quant_ms=%.2f unlock120=%d\n",
+                           "# turbo_v8 t=%.2f fps=%.1f hdr_mode=%d(%s) aniso_upgrades=%u decouple_mode=%d(%s) decouple_skipped_quants=%u decouple_skipped_renders=%u last_real_quant_ms=%.2f unlock120=%d\n",
                            total_el, fps, g_m2HdrMode, M2_HdrModeName(g_m2HdrMode), an,
-                           g_m2DecoupleMode, M2_DecoupleModeName(g_m2DecoupleMode), sk, g_m2LastRealQuantMs, g_m2Unlock120Installed);
+                           g_m2DecoupleMode, M2_DecoupleModeName(g_m2DecoupleMode), sk, skr, g_m2LastRealQuantMs, g_m2Unlock120Installed);
         if (len > 0) {
             DWORD w = 0;
             WriteFile(g_logFile, line, (DWORD)len, &w, NULL);

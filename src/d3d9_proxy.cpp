@@ -4841,6 +4841,8 @@ static void M2_PfTelemetry(double tSec) {
 #include "m2_quant_distributor.h"
 #include "m2_pather_sse2.h"
 
+static int g_m2PostLoadWarmup = 120;
+static double g_m2LastRealQuantMs = 0.0;
 static inline int M2_DecoupleFilterQuant(int levelUp, int fdtMs, int detOn, int ms, int* outEffMs);
 static inline void M2_DecoupleRecordQuantMs(double qMs);
 
@@ -4888,7 +4890,13 @@ static void __fastcall Hook_AppQuant(void* self, void* edx, int ms) {
     int64_t dtQuantTicks = Qpc() - t0;
     g_quantTicks += dtQuantTicks;
     if (g_qpcFreq.QuadPart != 0) {
-        M2_DecoupleRecordQuantMs((double)dtQuantTicks * 1000.0 / (double)g_qpcFreq.QuadPart);
+        double q_ms = (double)dtQuantTicks * 1000.0 / (double)g_qpcFreq.QuadPart;
+        if (q_ms > 60.0) {
+            g_m2PostLoadWarmup = 120;
+            g_m2LastRealQuantMs = 0.0;
+        } else {
+            g_m2LastRealQuantMs = (g_m2LastRealQuantMs <= 0.1) ? q_ms : (g_m2LastRealQuantMs * 0.7 + q_ms * 0.3);
+        }
     }
     M2_R3QuantTick(M2_R3NowUs());   // Wave 3: moment the new simulation state became true
     g_inQuant = 0;
@@ -6143,6 +6151,10 @@ static void M2_DCTelemetry(double tSec) {
 }
 // ---- M2_PRESENT_END ----
 
+static HRESULT STDMETHODCALLTYPE Hook_Present(
+    void* pDevice, const RECT* pSourceRect, const RECT* pDestRect,
+    HWND hDestWindowOverride, const RGNDATA* pDirtyRegion);
+
 #include "m2_turbo_hud.h"
 
 static HRESULT STDMETHODCALLTYPE Hook_Present(
@@ -6181,6 +6193,10 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
     // presents here exactly like stock).
     int dcOwnsSwap = 0;
     if (g_dcEnabled) dcOwnsSwap = (M2_DCOnPresent(pDevice, M2_R3TickToUs(now.QuadPart)) == 0);
+    if (gate && !dcOwnsSwap) {
+        M2_TurboV10_OnBeforePresent(pDevice);
+        M2_TurboHud_PollHotkeys(pDevice);
+    }
     int64_t tp0 = Qpc();
     g_inPresent = 1;
     HRESULT hr = S_OK;
@@ -6195,7 +6211,6 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
     InstallQuantDistributorHook();             // Parallel distributor (5 P-cores)
     ProfilerTick(now);
     if (!g_m2HudWnd && hDestWindowOverride) g_m2HudWnd = hDestWindowOverride;
-    M2_TurboHud_PollHotkeys(pDevice);
     M2_TurboHud_OnPresent(pDevice);
     if (!g_levelUp && (g_draws > 200 || (g_r3Draws - g_r3DrawsAtP) > 80)) {
         g_levelUp = true;
@@ -6549,16 +6564,17 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         if (cmdLine && (strstr(cmdLine, "-autostart") || strstr(cmdLine, "-benchmark") || strstr(cmdLine, "m2_autostart"))) {
             g_autostart = true;
         }
-        if (g_autostart) {
+        const char* noDlcEnv = getenv("M2_BENCH_NO_DLC");
+        if (noDlcEnv && strcmp(noDlcEnv, "1") == 0) {
             DWORD oldProt = 0;
             if (VirtualProtect((void*)0x004D46A6, 5, PAGE_EXECUTE_READWRITE, &oldProt)) {
                 uint8_t patch[5] = {0xB0, 0x01, 0x90, 0x90, 0x90};
                 memcpy((void*)0x004D46A6, patch, 5);
                 VirtualProtect((void*)0x004D46A6, 5, oldProt, &oldProt);
-                LogLine("golden_v9: benchmark autostart -> patched Majesty2.exe 0x004D46A6 to B0 01 90 90 90 (skip DLC dialog)");
+                LogLine("golden_v10: M2_BENCH_NO_DLC=1 -> patched Majesty2.exe 0x004D46A6 to B0 01 90 90 90 (skip DLC dialog)");
             }
         } else {
-            LogLine("golden_v9: normal mode -> leaving 0x004D46A6 untouched (DLC selector enabled)");
+            LogLine("golden_v10: normal mode -> leaving 0x004D46A6 untouched (4-DLC selector enabled)");
         }
     } else if (fdwReason == DLL_THREAD_DETACH) {
         M2A_ThreadDetach();
