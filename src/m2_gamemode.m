@@ -1,4 +1,6 @@
-// libm2_gamemode.dylib — push the Wine game window into native AppKit fullscreen so gamepolicyd engages macOS Game Mode.
+// libm2_gamemode.dylib — push the Wine D3D9 game window (>=800x600) into native AppKit fullscreen
+// so gamepolicyd engages macOS Game Mode, while leaving the small Win32 M2_LauncherWindow (~500x450)
+// completely untouched so DLC selection works natively.
 // Universal build: clang -arch x86_64 -arch arm64 -dynamiclib -fobjc-arc -framework AppKit -o build/libm2_gamemode.dylib src/m2_gamemode.m
 #import <AppKit/AppKit.h>
 #import <objc/message.h>
@@ -8,9 +10,28 @@
 
 static BOOL m2_done = NO;
 static BOOL m2_transitioning = NO;
+static NSTimeInterval m2_first_visible_ts = 0.0;
+
+static BOOL m2_is_large_window(NSWindow *w) {
+    if (!w) return NO;
+    NSRect f = w.frame;
+    return (f.size.width >= 800.0 && f.size.height >= 600.0);
+}
+
+static BOOL m2_has_visible_launcher_window(void) {
+    for (NSWindow *w in NSApp.windows) {
+        if (!w || !w.visible || w.isMiniaturized) continue;
+        NSRect f = w.frame;
+        if (f.size.width >= 150.0 && f.size.width < 800.0 &&
+            f.size.height >= 150.0 && f.size.height < 700.0) {
+            return YES;
+        }
+    }
+    return NO;
+}
 
 static void m2_tag_fullscreen_primary(NSWindow *w) {
-    if (!w) return;
+    if (!m2_is_large_window(w)) return;
     NSWindowCollectionBehavior b = w.collectionBehavior;
     b &= ~(NSWindowCollectionBehaviorFullScreenAuxiliary | NSWindowCollectionBehaviorFullScreenNone);
     b |= NSWindowCollectionBehaviorFullScreenPrimary;
@@ -19,24 +40,24 @@ static void m2_tag_fullscreen_primary(NSWindow *w) {
     }
 }
 
-static BOOL m2_is_wine_fullscreen(NSWindow *w) {
-    SEL sel = NSSelectorFromString(@"isFullscreen");
-    if ([w respondsToSelector:sel]) {
-        return ((BOOL (*)(id, SEL))objc_msgSend)(w, sel);
-    }
-    return NO;
-}
-
 static BOOL m2_is_game_window(NSWindow *w) {
     if (!w || !w.visible || w.isMiniaturized) return NO;
+    if (!m2_is_large_window(w)) return NO;
+    if (m2_has_visible_launcher_window()) return NO;
     NSRect s = w.screen ? w.screen.frame : NSScreen.mainScreen.frame;
     NSRect f = w.frame;
     return ([w.title rangeOfString:@"Majesty"].location != NSNotFound) ||
-           (f.size.width >= s.size.width * 0.85 && f.size.height >= s.size.height * 0.85);
+           (f.size.width >= s.size.width * 0.80 && f.size.height >= s.size.height * 0.80);
 }
 
 static void (*orig_adjustFullScreenBehavior)(id, SEL, NSUInteger) = NULL;
 static void m2_swizzled_adjustFullScreenBehavior(NSWindow *self, SEL _cmd, NSUInteger behavior) {
+    if (!m2_is_large_window(self)) {
+        if (orig_adjustFullScreenBehavior) {
+            orig_adjustFullScreenBehavior(self, _cmd, behavior);
+        }
+        return;
+    }
     behavior &= ~(NSWindowCollectionBehaviorFullScreenAuxiliary | NSWindowCollectionBehaviorFullScreenNone);
     behavior |= NSWindowCollectionBehaviorFullScreenPrimary;
     if (orig_adjustFullScreenBehavior) {
@@ -55,6 +76,7 @@ static void m2_swizzled_setWindowFeatures(NSWindow *self, SEL _cmd, void *featur
     if (orig_setWindowFeatures) {
         orig_setWindowFeatures(self, _cmd, features);
     }
+    if (!m2_is_large_window(self)) return;
     m2_tag_fullscreen_primary(self);
     if (!(self.styleMask & NSWindowStyleMaskResizable)) {
         self.styleMask |= NSWindowStyleMaskResizable;
@@ -71,35 +93,62 @@ static void m2_swizzle_winewindow_if_needed(void) {
     if (mAdjust) {
         orig_adjustFullScreenBehavior = (void (*)(id, SEL, NSUInteger))method_getImplementation(mAdjust);
         method_setImplementation(mAdjust, (IMP)m2_swizzled_adjustFullScreenBehavior);
-        NSLog(@"[M2-GameMode] Swizzled -[WineWindow adjustFullScreenBehavior:]");
+        NSLog(@"[M2-GameMode] Swizzled -[WineWindow adjustFullScreenBehavior:] (large-window gated)");
     }
     Method mFeatures = class_getInstanceMethod(cls, NSSelectorFromString(@"setWindowFeatures:"));
     if (mFeatures) {
         orig_setWindowFeatures = (void (*)(id, SEL, void *))method_getImplementation(mFeatures);
         method_setImplementation(mFeatures, (IMP)m2_swizzled_setWindowFeatures);
-        NSLog(@"[M2-GameMode] Swizzled -[WineWindow setWindowFeatures:]");
+        NSLog(@"[M2-GameMode] Swizzled -[WineWindow setWindowFeatures:] (large-window gated)");
     }
 }
 
-static void m2_try_fullscreen(NSWindow *w) {
-    if (m2_done || m2_transitioning || !m2_is_game_window(w)) return;
+static void m2_poll_windows(void) {
     m2_swizzle_winewindow_if_needed();
-    m2_tag_fullscreen_primary(w);
-    if (w.styleMask & NSWindowStyleMaskFullScreen) {
-        m2_done = YES;
-        NSLog(@"[M2-GameMode] Window '%@' already in native AppKit FullScreen Space; FullScreenPrimary confirmed", w.title);
+    NSWindow *candidate = nil;
+    for (NSWindow *w in NSApp.windows) {
+        if (m2_is_game_window(w)) {
+            candidate = w;
+            break;
+        }
+    }
+    if (!candidate) {
+        m2_first_visible_ts = 0.0;
+        if (m2_done) {
+            m2_done = NO;
+        }
         return;
     }
-    // In AppKit, borderless windows (styleMask=0x0) cannot enter native FullScreen space
-    // unless NSWindowStyleMaskResizable is present on styleMask.
-    if (!(w.styleMask & NSWindowStyleMaskResizable)) {
-        w.styleMask |= NSWindowStyleMaskResizable;
+    m2_tag_fullscreen_primary(candidate);
+    if (candidate.styleMask & NSWindowStyleMaskFullScreen) {
+        if (!m2_done) {
+            m2_done = YES;
+            NSLog(@"[M2-GameMode] Window '%@' (%.0fx%.0f) confirmed in native AppKit FullScreen Space",
+                  candidate.title, candidate.frame.size.width, candidate.frame.size.height);
+        }
+        return;
+    }
+    if (m2_done || m2_transitioning) return;
+
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (m2_first_visible_ts == 0.0) {
+        m2_first_visible_ts = now;
+        return;
+    }
+    // Require the >=800x600 game window to remain continuously visible for >=1.2s
+    // so the 0.25s pre-launcher splash window never triggers FullScreen before M2_LauncherWindow opens.
+    if ((now - m2_first_visible_ts) < 1.2) {
+        return;
+    }
+
+    if (!(candidate.styleMask & NSWindowStyleMaskResizable)) {
+        candidate.styleMask |= NSWindowStyleMaskResizable;
     }
     m2_transitioning = YES;
-    NSLog(@"[M2-GameMode] Transitioning window '%@' (styleMask=0x%lx) into native AppKit FullScreen Space for gamepolicyd",
-          w.title, (unsigned long)w.styleMask);
+    NSLog(@"[M2-GameMode] Transitioning D3D9 window '%@' (%.0fx%.0f, styleMask=0x%lx) into native AppKit FullScreen Space",
+          candidate.title, candidate.frame.size.width, candidate.frame.size.height, (unsigned long)candidate.styleMask);
     dispatch_async(dispatch_get_main_queue(), ^{
-        [w toggleFullScreen:nil];
+        [candidate toggleFullScreen:nil];
     });
 }
 
@@ -113,31 +162,31 @@ __attribute__((constructor)) static void m2_gamemode_init(void) {
                 NSWindow *w = (NSWindow *)n.object;
                 m2_tag_fullscreen_primary(w);
                 m2_transitioning = NO;
-                m2_done = YES;
-                NSLog(@"[M2-GameMode] Confirmed NSWindowDidEnterFullScreenNotification for '%@'", w.title);
+                if (m2_is_large_window(w)) {
+                    m2_done = YES;
+                    NSLog(@"[M2-GameMode] Confirmed NSWindowDidEnterFullScreenNotification for '%@' (%.0fx%.0f)",
+                          w.title, w.frame.size.width, w.frame.size.height);
+                }
             }];
         [NSNotificationCenter.defaultCenter addObserverForName:@"NSWindowDidFailToEnterFullScreenNotification"
             object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
                 m2_transitioning = NO;
-                NSLog(@"[M2-GameMode] Window '%@' failed to enter FullScreen Space; will not corrupt styleMask",
+                m2_first_visible_ts = 0.0;
+                NSLog(@"[M2-GameMode] Window '%@' failed to enter FullScreen Space; will retry",
                       ((NSWindow *)n.object).title);
             }];
-        [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidBecomeMainNotification
+        [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidExitFullScreenNotification
             object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
-                m2_try_fullscreen((NSWindow *)n.object);
+                m2_transitioning = NO;
+                m2_done = NO;
+                m2_first_visible_ts = 0.0;
             }];
-        [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidBecomeKeyNotification
-            object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
-                m2_try_fullscreen((NSWindow *)n.object);
-            }];
-        __block int tries = 0;
         __block void (^poll)(void);
         __weak __block void (^weakPoll)(void);
         weakPoll = poll = ^{
-            if (m2_done || ++tries > 60) return;
-            for (NSWindow *w in NSApp.windows) m2_try_fullscreen(w);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), weakPoll);
+            m2_poll_windows();
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), weakPoll);
         };
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), poll);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), poll);
     });
 }
